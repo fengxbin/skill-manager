@@ -1,103 +1,103 @@
 # skill-manager
 
-多 Agent 技能管理器：**一个 Git 仓库是唯一真相源，各 Agent 目录里只放指向它的链接**
-（POSIX 用 symlink，Windows 用 junction）。改仓库一次全员生效；换机 `clone` + `restore` 恢复。
-支持 73 种 Agent 目录，清单见 [`references/targets.md`](references/targets.md)。
-所有逻辑在 `scripts/skillkit.py`（Python 3.8+，仅标准库）。
+让所有 AI 编程工具（Pi、Codex、Claude Code、Cursor、Kimi、Qwen Code、CodeBuddy…共 73 种）
+**共用同一份技能文件**。技能只存一份，工具目录里放的是"快捷方式"（软链接），
+所以改一次全部生效，换电脑一条命令恢复。
 
-## 快速开始
+## 先分清两个东西，不然一定糊涂
 
-先把这个脚本装成一个命令（一次性，装完在任何目录都能直接敲 `skillkit`）：
+| | 是什么 | 放在哪 |
+|---|---|---|
+| ① **本项目** | 工具本身（几个脚本 + 说明） | 你 clone 下来的目录，比如 `~/skill-manager` |
+| ② **你的技能仓库** | 存你所有技能的地方（一个 Git 仓库，可以推到自己的 GitHub） | 由 `init` 创建，比如 `~/skills-repo` 或 `D:\skills-repo` |
 
-```bash
-cd <skill-manager 目录>
-ln -sf "$PWD/scripts/skillkit.py" ~/.local/bin/skillkit    # ~/.local/bin 需在 PATH 里
-skillkit --version
-```
+①是"管家"，②是"仓库"。装①只是让 Agent 学会用这个管家；②要等你说一句"初始化技能仓库"才会建。
 
-Windows 下把 `skillkit.py` 复制/链接到已在 PATH 的目录（如 `%USERPROFILE%\.local\bin`），
-或用 `python C:\path\to\skillkit.py <命令>`。
+## 一、安装（3 步）
 
-然后：
+**第 1 步：下载**
 
 ```bash
-skillkit targets                 # 本机有哪些 Agent 目录
-skillkit scan --include-windows  # 只读盘点：副本数 / 内容冲突 / 被别家管理的
-skillkit init                    # dry-run（交互终端会问一次仓库位置）
-skillkit init --apply            # 备份 + 迁移 + 建链 + 本地提交
-skillkit doctor                  # 体检
+git clone https://github.com/fengxbin/skill-manager.git ~/skill-manager
 ```
 
-不想装也行，等价写法：`python3 <skill-manager>/scripts/skillkit.py <命令>`。
-
-日常与换机：
+**第 2 步：在你常用的工具里放一个快捷方式**（用哪个工具就敲哪行）
 
 ```bash
-skillkit add <repo-url|dir> --apply      # 安装 = 进仓库 + 建链 + 提交
-skillkit push --apply                    # 推远端
-skillkit pull --apply                    # 拉取 + 重建链
-skillkit list                            # 每个技能链到了哪里
-skillkit remove <name> --apply           # 解链 + 移入 .trash
-
-git clone <repo-url> ~/skills-repo && skillkit restore --apply && skillkit doctor   # 换机
+mkdir -p ~/.pi/agent/skills && ln -s ~/skill-manager ~/.pi/agent/skills/skill-manager   # Pi
+mkdir -p ~/.codex/skills     && ln -s ~/skill-manager ~/.codex/skills/skill-manager      # Codex
+mkdir -p ~/.claude/skills    && ln -s ~/skill-manager ~/.claude/skills/skill-manager     # Claude Code
+mkdir -p ~/.kimi/skills      && ln -s ~/skill-manager ~/.kimi/skills/skill-manager       # Kimi
 ```
 
-## 在 Agent 里怎么用
+Windows 上用目录联接（不需要管理员）：
 
-本工具**不新增、不重命名、不改写任何技能**：只建链接，技能目录名、`SKILL.md`、以及各客户端
-已有的调用方式都保持原样。链接进去之后由客户端按它自己的规则暴露入口——Pi 是
-`/skill:<技能目录名>`，Claude Code / Cursor 出现在 `/` 菜单，Codex 只支持技能（`/prompts` 已移除）。
-也可以直接用自然语言描述需求。本技能自身支持的动词（`scan` / `doctor` / `init` …）见
-`SKILL.md` 的 Slash entry points 一节。
+```powershell
+cmd /c mklink /J "%USERPROFILE%\.codex\skills\skill-manager" "%USERPROFILE%\skill-manager"
+```
 
-## 仓库位置
+**第 3 步：确认装上了**
 
-`--repo` → `SKILLKIT_REPO` → `~/.config/skillkit/location`（`init` 写入，之后无需带路径）→ 自动探测。
-`skillkit repo` 查看来源，`repo --set PATH` / `--forget` 管理。
-推荐值：WSL 且有 Windows 环境 → `/mnt/<非C盘>/skills-repo`（两侧都能用）；否则 `~/skills-repo`。
-落在 Agent skills 目录内、`skills/` 本身、或云同步盘里的路径会被拒绝。
+```bash
+ls ~/.pi/agent/skills/skill-manager/SKILL.md    # 能列出文件就成功了
+```
 
-## 命令
+然后**新开**一个 Agent 会话，输入 `/skill:skill-manager`（Pi）或直接说话，见下一节。
 
-所有写操作默认 **dry-run**，须加 `--apply`；`--json` 输出可解析结果。
+## 二、装好之后怎么用：跟 Agent 说话就行
 
-| 命令 | 作用 |
+不用背命令，把需求说出来，Agent 会自己按技能里的说明操作：
+
+| 你想干什么 | 就这么说 |
 |---|---|
-| `targets` / `scan` | 本机 Agent 目录 / 技能盘点（含冲突与被别家管理项） |
-| `init` | 建仓库 → 迁移（备份/移动）→ 建链 → 提交 |
-| `add <dir\|url>` / `update` | 安装技能 / 按记录的上游刷新 |
-| `link` / `unlink` | 建链 / 解链（文件本体留在仓库） |
-| `remove` / `trash` | 解链后移入 `.trash` / 列垃圾箱或 `--purge` |
-| `restore` | 按仓库内容重建全部链接 |
-| `list` / `status` / `doctor` | 查看 / 状态 / 体检（`--fix` 只修链接） |
-| `repo` | 仓库位置：查看 / 设置 / 清除记录 |
-| `push` / `pull` | Git 同步 |
+| 先看看情况（推荐第一步） | "帮我盘点一下本机所有技能，看看有没有重复和内容冲突" |
+| 把散在各工具里的技能收拢到一处 | "帮我初始化技能仓库" |
+| 装一个新技能 | "把这个技能装进来：https://github.com/某人/某仓库" |
+| 某个工具里技能加载不出来 | "我的技能在 Codex 里不显示，帮我查一下" |
+| 同步到自己的 GitHub | "同步一下技能仓库" |
+| 删掉某个技能 | "把 old-skill 移掉"（它会先问你再动） |
 
-## 规则
+Pi 里也可以直接敲 `/skill:skill-manager <动词>`，例如 `/skill:skill-manager doctor`；
+Claude Code / Cursor 在 `/` 菜单里能看到它；Codex 目前只有技能机制（旧的 `/prompts` 已取消）。
 
-1. **同名冲突保留最新版本**：取修改时间最新的一份，其余备份到 `.skill-manager/backup/`，
-   原位置改为链接（`init` 会列出每个变体的副本数、时间、路径）。
-2. **只操作当前用户**：目标必须在当前用户 HOME 下；WSL 侧只处理同名 Windows profile，
-   不一致直接拒绝（`--allow-cross-user` 才例外）。
-3. **不改动技能本身**：仓库目录与所有链接都沿用技能**原始的目录名**；`SKILL.md` 逐字节复制/移动，
-   从不改写、从不重命名（frontmatter `name` 只作报告用）。因此各客户端现有的调用命令不变。
-4. **项目级与已被别家管理的技能不动**：`<project>/.claude/skills` 等不在范围；已是
-   symlink/junction、或带 `skills-lock.json`/`install.json`/内嵌 `.git` 的目录只报告、不接管。
-
-## 删除与回滚
-
-无递归删除：`init` 先复制到 `backup/<ts>/` 再移动原目录；`remove` 移动到 `trash/<ts>/<name>`；
-`trash` 默认只列清单。真要清理时先打印全部路径，再加 `--confirm-delete` 并手输 `DELETE`：
+## 三、想自己敲命令（可选，Agent 不在手边时用）
 
 ```bash
-skillkit trash --purge <name> --confirm-delete
+python3 ~/skill-manager/scripts/skillkit.py targets    # 本机有哪些工具的技能目录
+python3 ~/skill-manager/scripts/skillkit.py scan       # 只读盘点：副本、冲突
+python3 ~/skill-manager/scripts/skillkit.py init       # 先看计划，不动手
+python3 ~/skill-manager/scripts/skillkit.py init --apply   # 确认后执行
+python3 ~/skill-manager/scripts/skillkit.py doctor     # 体检
 ```
 
-回滚：把 `backup/<ts>/` 或 `trash/<ts>/` 中的目录移回原位置（先移除该处链接）。
-推送前 `doctor` 会扫描疑似密钥并告警。
+嫌长可以装成命令，之后用 `skillkit <命令>`：
 
-## 文件
+```bash
+ln -sf ~/skill-manager/scripts/skillkit.py ~/.local/bin/skillkit   # ~/.local/bin 要在 PATH 里
+skillkit targets
+```
 
-`SKILL.md`（Agent 操作契约）· `scripts/skillkit.py` ·
-`references/{targets,migration,troubleshooting,design}.md` ·
-`assets/{repo-readme-template,agents-md-snippet}.md`、`config.example.json`
+**所有会改东西的命令默认只打印计划，加 `--apply` 才真的执行。**
+
+## 四、它不会动你的东西
+
+- 只建快捷方式：**不改技能内容、不改目录名、不改任何工具里已有的调用方式**
+- 删除 = 移到 `.skill-manager/trash/`，不是真删；真要清空会先列出全部路径再问你
+- 只操作你当前用户；项目里的技能、被别人工具管着的技能，只看不动，只在报告里提一句
+
+## 五、几个常见问题
+
+**WSL 和 Windows 都要用同一个技能库？**
+把技能仓库放在 Windows 能看到的盘（如 `/mnt/d/skills-repo` = `D:\skills-repo`），
+然后两边各跑一次 `skillkit restore --apply`。放在 WSL 内部（`~/`）时 Windows 侧看不到。
+
+**技能名重复但内容不一样怎么办？**
+保留**最后修改时间最新**的那份，其余自动备份到 `.skill-manager/backup/`，原位置改成快捷方式。
+
+**要什么环境？**
+Python 3.8+ 和 git。Windows、Linux、macOS、WSL 都行。
+
+## 六、文件说明
+
+`SKILL.md` 是给 Agent 看的操作说明；`scripts/skillkit.py` 是全部功能的实现；
+`references/` 里是参考手册（工具目录表、迁移流程、排错、设计说明）；`assets/` 是给你自己技能仓库用的模板。

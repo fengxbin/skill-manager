@@ -24,26 +24,30 @@ Everything is done by `scripts/skillkit.py` (Python 3.8+, stdlib only).
 
 ## Hard rules (do not break these)
 
-1. **Newest wins.** When the same skill name has different content in several agent dirs,
+1. **Never rename a skill and never edit its `SKILL.md`.** The repo directory and every link
+   keep the skill's ORIGINAL directory name, so whatever command the agent already uses keeps
+   working. Frontmatter `name` is read-only metadata (only reported when it differs); payload
+   files are copied/moved byte for byte, never rewritten.
+2. **Newest wins.** When the same skill name has different content in several agent dirs,
    the copy with the **newest modification time** becomes the repo truth; everything else is
    backed up and stepped aside. Never pick by hand without telling the user which one won.
-2. **Scope = the current user only.** Never touch another user's home, `/root`, system dirs,
+3. **Scope = the current user only.** Never touch another user's home, `/root`, system dirs,
    or a Windows profile that is not the logged-in user (the CLI refuses; `--allow-cross-user`
    exists but requires an explicit reason from the user).
-3. **Project-level skills stay put.** `<project>/.claude/skills`, `<project>/.agents/skills`
+4. **Project-level skills stay put.** `<project>/.claude/skills`, `<project>/.agents/skills`
    and friends are out of scope. Report them if you see them, do not migrate them.
-4. **Skills already managed by another tool are skipped and reported.** Symlink/junction,
+5. **Skills already managed by another tool are skipped and reported.** Symlink/junction,
    `skills-lock.json`, `.skill-manager.json`, `install.json`, or an embedded `.git` → leave it,
    say so. Never adopt or overwrite.
-5. **Never copy a skill into an agent directory.** Payload lives in the repo; agents get links.
-6. **Never delete.** `remove` moves payloads to `<repo>/.skill-manager/trash/<ts>/`.
+6. **Never copy a skill into an agent directory.** Payload lives in the repo; agents get links.
+7. **Never delete.** `remove` moves payloads to `<repo>/.skill-manager/trash/<ts>/`.
    Deletion (batch or recursive) is forbidden by the user's global rule: if it is ever
    genuinely needed, print the exact paths, ask the user, wait for confirmation, then — only
    with `trash --purge <name> --confirm-delete` — delete one path at a time. Never `rm -rf`,
    `del /s`, `Remove-Item -Recurse`, `shutil.rmtree`.
-7. **Dry-run first.** Every mutating command prints a plan and writes nothing without `--apply`.
+8. **Dry-run first.** Every mutating command prints a plan and writes nothing without `--apply`.
    Show the plan, get a yes, then re-run with `--apply`.
-8. Prefer `--json` when you need to reason about the output.
+9. Prefer `--json` when you need to reason about the output.
 
 ## Slash entry points
 
@@ -160,6 +164,7 @@ part of the task; purging is the user's decision (`trash --purge` is double-gate
 |---|---|
 | Same name, different content | newest mtime wins (`--prefer majority` only if the user asks) — report every variant with path + date and which one won |
 | Dir is a symlink/junction, or has `skills-lock.json` / `install.json` / `.git` | skip + report "managed by another tool"; never adopt |
+| Frontmatter `name` != directory name | keep the directory name, report the mismatch (`doctor` warns); do not rename |
 | Skill has an embedded `.git` (git-cloned upstream) | prefer `add <url>`; `init` leaves it alone |
 | Project-level `.claude/skills` etc. | out of scope; mention it, do not migrate |
 | Windows target while in WSL | repo must be on `/mnt/<drive>/…`; junction is created via `cmd.exe` |

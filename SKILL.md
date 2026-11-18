@@ -12,6 +12,8 @@ set can serve Claude Code, Codex, Pi, DSH, Kimi, Qwen, CodeBuddy, ZCode, Trae, C
 Antigravity, Cursor, Cline/Roo/Kilo, OpenCode, Windsurf and the rest.
 
 Everything is done by `scripts/skillkit.py` (Python 3.8+, stdlib only).
+If it has been installed on PATH as `skillkit`, the examples below can drop the
+`python3 <skill>/scripts/` prefix (e.g. `skillkit doctor`); use the full path otherwise.
 
 ## When to use
 

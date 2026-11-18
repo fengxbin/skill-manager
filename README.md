@@ -7,26 +7,39 @@
 
 ## 快速开始
 
-```bash
-S=<skill>/scripts/skillkit.py
+先把这个脚本装成一个命令（一次性，装完在任何目录都能直接敲 `skillkit`）：
 
-python3 $S targets                  # 本机有哪些 Agent 目录
-python3 $S scan --include-windows   # 只读盘点：副本数 / 内容冲突 / 被别家管理的
-python3 $S init                     # dry-run（交互终端会问一次仓库位置）
-python3 $S init --apply             # 备份 + 迁移 + 建链 + 本地提交
-python3 $S doctor                   # 体检
+```bash
+cd <skill-manager 目录>
+ln -sf "$PWD/scripts/skillkit.py" ~/.local/bin/skillkit    # ~/.local/bin 需在 PATH 里
+skillkit --version
 ```
+
+Windows 下把 `skillkit.py` 复制/链接到已在 PATH 的目录（如 `%USERPROFILE%\.local\bin`），
+或用 `python C:\path\to\skillkit.py <命令>`。
+
+然后：
+
+```bash
+skillkit targets                 # 本机有哪些 Agent 目录
+skillkit scan --include-windows  # 只读盘点：副本数 / 内容冲突 / 被别家管理的
+skillkit init                    # dry-run（交互终端会问一次仓库位置）
+skillkit init --apply            # 备份 + 迁移 + 建链 + 本地提交
+skillkit doctor                  # 体检
+```
+
+不想装也行，等价写法：`python3 <skill-manager>/scripts/skillkit.py <命令>`。
 
 日常与换机：
 
 ```bash
-python3 $S add <repo-url|dir> --apply     # 安装 = 进仓库 + 建链 + 提交
-python3 $S push --apply                   # 推远端
-python3 $S pull --apply                   # 拉取 + 重建链
-python3 $S list                           # 每个技能链到了哪里
-python3 $S remove <name> --apply          # 解链 + 移入 .trash
+skillkit add <repo-url|dir> --apply      # 安装 = 进仓库 + 建链 + 提交
+skillkit push --apply                    # 推远端
+skillkit pull --apply                    # 拉取 + 重建链
+skillkit list                            # 每个技能链到了哪里
+skillkit remove <name> --apply           # 解链 + 移入 .trash
 
-git clone <repo-url> ~/skills-repo && python3 $S restore --apply && python3 $S doctor   # 换机
+git clone <repo-url> ~/skills-repo && skillkit restore --apply && skillkit doctor   # 换机
 ```
 
 ## 在 Agent 里怎么用
@@ -40,7 +53,7 @@ git clone <repo-url> ~/skills-repo && python3 $S restore --apply && python3 $S d
 ## 仓库位置
 
 `--repo` → `SKILLKIT_REPO` → `~/.config/skillkit/location`（`init` 写入，之后无需带路径）→ 自动探测。
-`python3 $S repo` 查看来源，`repo --set PATH` / `--forget` 管理。
+`skillkit repo` 查看来源，`repo --set PATH` / `--forget` 管理。
 推荐值：WSL 且有 Windows 环境 → `/mnt/<非C盘>/skills-repo`（两侧都能用）；否则 `~/skills-repo`。
 落在 Agent skills 目录内、`skills/` 本身、或云同步盘里的路径会被拒绝。
 
@@ -77,7 +90,7 @@ git clone <repo-url> ~/skills-repo && python3 $S restore --apply && python3 $S d
 `trash` 默认只列清单。真要清理时先打印全部路径，再加 `--confirm-delete` 并手输 `DELETE`：
 
 ```bash
-python3 $S trash --purge <name> --confirm-delete
+skillkit trash --purge <name> --confirm-delete
 ```
 
 回滚：把 `backup/<ts>/` 或 `trash/<ts>/` 中的目录移回原位置（先移除该处链接）。

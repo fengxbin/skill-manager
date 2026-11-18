@@ -15,31 +15,48 @@
 
 ## 一、安装（3 步）
 
-**第 1 步：下载**
+**第 1 步：下载到哪**
+
+`git clone <地址> <目标目录>` —— 第二个参数就是下载位置，不写则下载到**当前目录**下的同名文件夹。
+本项目本身只有一个技能，建议按下表选位置（**只下一份**，别下两遍，否则会各改各的）：
+
+| 你的情况 | 下载到 | WSL 里的路径 | Windows 里看到的路径 |
+|---|---|---|---|
+| 只用 WSL 里的工具（Pi 等） | `~/skill-manager` | `/home/你/skill-manager` | Windows 看不到 |
+| WSL + Windows 都要用（推荐） | D 盘 | `/mnt/d/skill-manager` | `D:\skill-manager` |
+| 只用 Windows 里的工具 | 用户目录 | — | `C:\Users\你\skill-manager` |
 
 ```bash
-git clone https://github.com/fengxbin/skill-manager.git ~/skill-manager
+# WSL + Windows 共用（推荐）：放在两边都看得见的 D 盘
+git clone https://github.com/fengxbin/skill-manager.git /mnt/d/skill-manager
 ```
 
-**第 2 步：在你常用的工具里放一个快捷方式**（用哪个工具就敲哪行）
+**第 2 步：在工具目录里放一个"快捷方式"，指向刚才下载的位置**
+
+WSL 里的工具用软链接（`-s`）：
 
 ```bash
-mkdir -p ~/.pi/agent/skills && ln -s ~/skill-manager ~/.pi/agent/skills/skill-manager   # Pi
-mkdir -p ~/.codex/skills     && ln -s ~/skill-manager ~/.codex/skills/skill-manager      # Codex
-mkdir -p ~/.claude/skills    && ln -s ~/skill-manager ~/.claude/skills/skill-manager     # Claude Code
-mkdir -p ~/.kimi/skills      && ln -s ~/skill-manager ~/.kimi/skills/skill-manager       # Kimi
+mkdir -p ~/.pi/agent/skills && ln -s /mnt/d/skill-manager ~/.pi/agent/skills/skill-manager   # Pi
+mkdir -p ~/.kimi/skills     && ln -s /mnt/d/skill-manager ~/.kimi/skills/skill-manager        # Kimi
 ```
 
-Windows 上用目录联接（不需要管理员）：
+Windows 里的工具用目录联接（在 PowerShell 里敲，不需要管理员）：
 
 ```powershell
-cmd /c mklink /J "%USERPROFILE%\.codex\skills\skill-manager" "%USERPROFILE%\skill-manager"
+cmd /c mklink /J "%USERPROFILE%\.codex\skills\skill-manager" "D:\skill-manager"
+cmd /c mklink /J "%USERPROFILE%\.claude\skills\skill-manager" "D:\skill-manager"
 ```
+
+> 如果第 1 步下载到了 `~/skill-manager`（WSL 内部），把上面的 `/mnt/d/skill-manager` 换成它，
+> 并且**不要**在 Windows 侧建链接——Windows 读不到 WSL 内部的文件。
 
 **第 3 步：确认装上了**
 
 ```bash
-ls ~/.pi/agent/skills/skill-manager/SKILL.md    # 能列出文件就成功了
+ls ~/.pi/agent/skills/skill-manager/SKILL.md          # WSL 侧：能列出文件就成功
+```
+```powershell
+dir "%USERPROFILE%\.codex\skills\skill-manager\SKILL.md"   # Windows 侧
 ```
 
 然后**新开**一个 Agent 会话，输入 `/skill:skill-manager`（Pi）或直接说话，见下一节。
@@ -87,9 +104,11 @@ skillkit targets
 
 ## 五、几个常见问题
 
-**WSL 和 Windows 都要用同一个技能库？**
-把技能仓库放在 Windows 能看到的盘（如 `/mnt/d/skills-repo` = `D:\skills-repo`），
-然后两边各跑一次 `skillkit restore --apply`。放在 WSL 内部（`~/`）时 Windows 侧看不到。
+**WSL 和 Windows 都要用？（两个东西都要放对）**
+- ①本项目：放 `/mnt/d/skill-manager`（= `D:\skill-manager`），两边共用一份
+- ②技能仓库：由 `init` 建在 `/mnt/d/skills-repo`（= `D:\skills-repo`），两边各跑一次 `skillkit restore --apply`
+
+放在 WSL 内部（`~/`）时，Windows 侧一律看不到；WSL 侧的软链接也无法被 Windows 解析。
 
 **技能名重复但内容不一样怎么办？**
 保留**最后修改时间最新**的那份，其余自动备份到 `.skill-manager/backup/`，原位置改成快捷方式。

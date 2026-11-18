@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "targets": null,
+  "link_mode": "auto",
+  "category_layout": true,
+  "conflict_policy": "newest",
+  "sources": {
+    "example-skill": "https://github.com/owner/example-skill"
+  }
+}

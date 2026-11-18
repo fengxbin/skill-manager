@@ -661,9 +661,9 @@ def repo_skills(repo):
             continue
         if SKILL_FILE in files:
             meta, _ = read_frontmatter(curp / SKILL_FILE)
-            name = (meta.get("name") or curp.name).strip()
             out.append({
-                "name": name,
+                "name": curp.name,
+                "fm_name": (meta.get("name") or "").strip(),
                 "dir_name": curp.name,
                 "path": curp,
                 "rel": str(curp.relative_to(repo)).replace(os.sep, "/"),
@@ -732,7 +732,8 @@ def scan_env(ctx, env, home):
                 meta, _ = read_frontmatter(entry / SKILL_FILE)
                 nfiles = sum(len(f) for _, _, f in os.walk(entry))
                 found.append({
-                    "name": (meta.get("name") or entry.name).strip(),
+                    "name": entry.name,
+                    "fm_name": (meta.get("name") or "").strip(),
                     "dir_name": entry.name,
                     "path": entry,
                     "env": env,
@@ -1451,7 +1452,8 @@ def cmd_doctor(ctx):
         if not meta.get("name"):
             problems.append("%s: SKILL.md has no 'name' in frontmatter" % sk["rel"])
         elif meta["name"].strip() != sk["dir_name"]:
-            warnings.append("%s: name '%s' differs from dir '%s' (links use the name)" % (sk["rel"], meta["name"], sk["dir_name"]))
+            warnings.append("%s: frontmatter name '%s' != directory '%s'; links keep the DIRECTORY name "
+                            "(the skill is never renamed)" % (sk["rel"], meta["name"], sk["dir_name"]))
         if not meta.get("description"):
             problems.append("%s: SKILL.md has no 'description'" % sk["rel"])
         if sk["name"] in seen:
@@ -1576,8 +1578,7 @@ def cmd_add(ctx):
         if not is_skill_dir(source_dir):
             die("no SKILL.md in %s" % source_dir)
 
-    meta, _ = read_frontmatter(source_dir / SKILL_FILE)
-    name = args.name or meta.get("name") or source_dir.name
+    name = args.name or source_dir.name      # directory name wins: never rename a skill
     name = re.sub(r"[^A-Za-z0-9._-]", "-", name.strip())
     category = args.category
     dest = repo / "skills" / (category + "/" if category else "") / name

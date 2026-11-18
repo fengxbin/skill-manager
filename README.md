@@ -31,10 +31,11 @@ git clone <repo-url> ~/skills-repo && python3 $S restore --apply && python3 $S d
 
 ## 在 Agent 里怎么用
 
-技能被链接进 Agent 后，客户端会自动把它变成一个斜杠命令：Pi 用 `/skill:skill-manager <动词>`
-（如 `/skill:skill-manager doctor`），Claude Code / Cursor 在 `/` 菜单里出现，
-Codex 只支持技能（`/prompts` 已移除）。也可以用自然语言直接说"帮我盘一下 skill 有没有冲突"。
-动词与命令的对应关系见 `SKILL.md` 的 Slash entry points 一节。
+本工具**不新增、不重命名、不改写任何技能**：只建链接，技能目录名、`SKILL.md`、以及各客户端
+已有的调用方式都保持原样。链接进去之后由客户端按它自己的规则暴露入口——Pi 是
+`/skill:<技能目录名>`，Claude Code / Cursor 出现在 `/` 菜单，Codex 只支持技能（`/prompts` 已移除）。
+也可以直接用自然语言描述需求。本技能自身支持的动词（`scan` / `doctor` / `init` …）见
+`SKILL.md` 的 Slash entry points 一节。
 
 ## 仓库位置
 
@@ -65,7 +66,9 @@ Codex 只支持技能（`/prompts` 已移除）。也可以用自然语言直接
    原位置改为链接（`init` 会列出每个变体的副本数、时间、路径）。
 2. **只操作当前用户**：目标必须在当前用户 HOME 下；WSL 侧只处理同名 Windows profile，
    不一致直接拒绝（`--allow-cross-user` 才例外）。
-3. **项目级与已被别家管理的技能不动**：`<project>/.claude/skills` 等不在范围；已是
+3. **不改动技能本身**：仓库目录与所有链接都沿用技能**原始的目录名**；`SKILL.md` 逐字节复制/移动，
+   从不改写、从不重命名（frontmatter `name` 只作报告用）。因此各客户端现有的调用命令不变。
+4. **项目级与已被别家管理的技能不动**：`<project>/.claude/skills` 等不在范围；已是
    symlink/junction、或带 `skills-lock.json`/`install.json`/内嵌 `.git` 的目录只报告、不接管。
 
 ## 删除与回滚

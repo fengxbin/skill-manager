@@ -29,8 +29,8 @@ skills-repo/
 
 ```bash
 # 新增（本地目录或 Git 仓库）
-python3 <skill-manager>/scripts/skillkit.py add <dir|git-url> --apply
-python3 <skill-manager>/scripts/skillkit.py push --apply
+skillkit add <dir|git-url> --apply
+skillkit push --apply
 
 # 修改：直接改 skills/<name>/ 下的文件；链接会立刻反映到所有 Agent
 git add skills/<name> && git commit -m "update <name>" && git push
@@ -84,17 +84,17 @@ cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills-repo\skills\<na
 git clone <repo-url> ~/skills-repo
 
 # 2. 重建全部链接（先 dry-run 看清单，再 --apply）
-python3 <skill-manager>/scripts/skillkit.py restore --repo ~/skills-repo
-python3 <skill-manager>/scripts/skillkit.py restore --repo ~/skills-repo --apply
+skillkit restore --repo ~/skills-repo
+skillkit restore --repo ~/skills-repo --apply
 
 # 3. 体检
-python3 <skill-manager>/scripts/skillkit.py doctor --repo ~/skills-repo
+skillkit doctor --repo ~/skills-repo
 ```
 
 机器上已有"野生"技能目录时，用 `init` 而不是 `restore`（会先备份再迁移，冲突保留最新版本）：
 
 ```bash
-python3 <skill-manager>/scripts/skillkit.py init --repo ~/skills-repo --apply
+skillkit init --repo ~/skills-repo --apply
 ```
 
 ## For Agents

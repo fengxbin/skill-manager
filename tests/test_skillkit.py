@@ -309,6 +309,34 @@ class SkillkitTest(unittest.TestCase):
         r_ok = self.run_cli("push", "--apply", "--allow-secrets", "--json")
         self.assertEqual(json.loads(r_ok.stdout)["sync"]["status"], "ok")
 
+    def test_secret_scanner_ignores_example_files_and_code_false_positives(self):
+        bare = make_bare_remote(self.tmp)
+        self.run_cli("init", "--repo-url", bare.resolve().as_uri(), "--apply")
+
+        clean = make_skill(
+            self.tmp / "clean-code",
+            "clean-code",
+            body=(
+                "api_key = _require_api_key()\n"
+                "token = token_by_shape_id[slide_num]\n"
+                "OPENAI_API_KEY=your-openai-api-key\n"
+                "token: supercalifragilistic\n"
+            ),
+        )
+        (clean / ".env.example").write_text("# OPENAI_API_KEY=your-key\n", encoding="utf-8")
+        r_add = self.run_cli("add", str(clean), "--apply", "--json")
+        self.assertEqual(json.loads(r_add.stdout)["sync"]["status"], "ok")
+
+        # Real inline alphanumeric credential must still be blocked
+        fake_inline = "a9F2kL8m" + "N4pQ7rS1tU"
+        real_inline = make_skill(
+            self.tmp / "real-inline",
+            "real-inline",
+            body='api_key = "' + fake_inline + '"\n',
+        )
+        r_block = self.run_cli("add", str(real_inline), "--apply", "--json")
+        self.assertEqual(json.loads(r_block.stdout)["sync"]["status"], "blocked")
+
     def test_unlink_requires_args_and_pull_prunes_dangling_links(self):
         bare = make_bare_remote(self.tmp)
         remote_url = bare.resolve().as_uri()

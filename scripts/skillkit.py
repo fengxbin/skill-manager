@@ -177,9 +177,16 @@ SECRET_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
     (re.compile(r"(?i)\b(xox[baprs]-[A-Za-z0-9-]{10,})"), "Slack token"),
-    (re.compile(r"(?i)(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}"), "inline credential"),
 ]
+INLINE_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:api[_-]?key|secret|password|passwd|token)\s*[:=]\s*(['\"]?)([A-Za-z0-9_\-/+=]{16,})([^\s,;'\"]?)"
+)
+INLINE_PLACEHOLDER_PREFIXES = (
+    "your-", "your_", "example", "dummy", "fake", "placeholder",
+    "replace", "changeme", "sample", "xxx",
+)
 SECRET_FILE_HINTS = (".env", ".credentials", "auth.json", "id_rsa", "id_ed25519", ".pem", ".pfx", ".npmrc", ".pypirc")
+SECRET_FILE_SAFE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".md")
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -617,6 +624,29 @@ def _discover_skills_in_tree(root):
     return found
 
 
+def _is_secret_filename(name):
+    low = name.lower()
+    if any(low.endswith(s) for s in SECRET_FILE_SAFE_SUFFIXES):
+        return False
+    for h in SECRET_FILE_HINTS:
+        if low == h or low.startswith(h + ".") or low.endswith(h):
+            return True
+    return False
+
+
+def _has_inline_credential(text):
+    for m in INLINE_CREDENTIAL_RE.finditer(text):
+        quote, val, tail = m.group(1), m.group(2), m.group(3)
+        if not quote and tail in (".", "(", "["):
+            continue
+        low = val.lower()
+        if any(low.startswith(p) for p in INLINE_PLACEHOLDER_PREFIXES):
+            continue
+        if re.search(r"[A-Za-z]", val) and re.search(r"[0-9]", val):
+            return True
+    return False
+
+
 def scan_secrets(repo):
     """Scan all repo skills for likely secrets / credential files."""
     findings = []
@@ -626,7 +656,7 @@ def scan_secrets(repo):
             for name in files:
                 fp = Path(cur) / name
                 rel = str(fp.relative_to(repo)).replace(os.sep, "/")
-                if any(h in name.lower() for h in SECRET_FILE_HINTS):
+                if _is_secret_filename(name):
                     findings.append({"file": str(fp), "rel": rel, "reason": "possible secret file"})
                     continue
                 try:
@@ -635,10 +665,14 @@ def scan_secrets(repo):
                     text = fp.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     continue
+                matched = False
                 for rx, label in SECRET_PATTERNS:
                     if rx.search(text):
                         findings.append({"file": str(fp), "rel": rel, "reason": label})
+                        matched = True
                         break
+                if not matched and _has_inline_credential(text):
+                    findings.append({"file": str(fp), "rel": rel, "reason": "inline credential"})
     return findings
 
 
@@ -724,13 +758,19 @@ class Context(object):
                     self.repo_source = "recorded location (%s)" % loc
                     return cand
 
-        candidates = [
-            self.home / "skills-repo",
-            Path(DEFAULT_REPO).expanduser(),
-            self.home / "skills_repo",
-            Path(ALT_DEFAULT_REPO).expanduser(),
-            Path.cwd(),
-        ]
+        if os.environ.get("SKILLKIT_HOME"):
+            candidates = [
+                self.home / "skills-repo",
+                self.home / "skills_repo",
+            ]
+        else:
+            candidates = [
+                self.home / "skills-repo",
+                Path(DEFAULT_REPO).expanduser(),
+                self.home / "skills_repo",
+                Path(ALT_DEFAULT_REPO).expanduser(),
+                Path.cwd(),
+            ]
         seen = set()
         for cand in candidates:
             cand = cand.resolve()

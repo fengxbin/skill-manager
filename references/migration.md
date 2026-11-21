@@ -82,10 +82,11 @@ python3 scripts/skillkit.py init --repo <path> --include-windows --apply
 `--apply` 按顺序做：
 
 1. `git init` + `skill-manager.json` + `README.md` + `.gitignore` + `.gitattributes`（仓库为空时）。
-2. 每个 skill：先把原目录复制到 `.skill-manager/backup/<ts>/<env>/<name>/`，再**移动**到 `skills/<name>/`。
-3. 同名多副本：**保留最新版本**（默认 `--prefer newest`）；其余备份后移入 `.skill-manager/trash/<ts>/`。
-4. 自动创建通用落点（`~/.agents/skills`、`~/.config/agents/skills`）并在每个已存在的 Agent 目录建链（POSIX symlink，Windows junction）。
-5. `git commit`；若已配置远端且通过密钥扫描，自动推送到 GitHub（加 `--no-push` 可跳过）。
+2. 自动将 `skill-manager` 自身安全收编进 `skills/skill-manager/`（剥离 `.git`、记录上游 URL 到 `sources`；若原本装在某 Agent 目录内则先备份移走再换成链接；传 `--no-adopt-self` 可跳过）。
+3. 每个 skill：先把原目录复制到 `.skill-manager/backup/<ts>/<env>/<name>/`，再**移动**到 `skills/<name>/`。
+4. 同名多副本：**保留最新版本**（默认 `--prefer newest`）；其余备份后移入 `.skill-manager/trash/<ts>/`。
+5. 自动创建通用落点（`~/.agents/skills`、`~/.config/agents/skills`）并在每个已存在的 Agent 目录建链（POSIX symlink，Windows junction）。
+6. `git commit`；若已配置远端且通过密钥扫描，自动推送到 GitHub（加 `--no-push` 可跳过）。
 
 **不要**自己写 `mv` / `ln -s` 代替这一步：备份、冲突裁决、幂等、跨平台链接都在脚本里。
 

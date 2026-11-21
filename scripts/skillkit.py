@@ -37,6 +37,7 @@ CONFIG_NAME = "skill-manager.json"
 STATE_DIR = ".skill-manager"
 SKILL_FILE = "SKILL.md"
 SELF_SKILL_ROOT = Path(__file__).resolve().parent.parent
+SELF_UPSTREAM_URL = "https://github.com/fengxbin/skill-manager.git"
 
 # ---------------------------------------------------------------------------
 # Agent target table (the single place to add a new agent).
@@ -1421,6 +1422,19 @@ def choose_repo(ctx, args):
     return rec.resolve(), "recommended default", notes
 
 
+def _self_skill_name():
+    meta, _ = read_frontmatter(SELF_SKILL_ROOT / SKILL_FILE)
+    return (meta.get("name") or SELF_SKILL_ROOT.name or "skill-manager").strip()
+
+
+def _self_upstream_url():
+    if git_is_repo(SELF_SKILL_ROOT):
+        rc, out, _ = git(SELF_SKILL_ROOT, "remote", "get-url", "origin")
+        if rc == 0 and out.strip():
+            return out.strip()
+    return SELF_UPSTREAM_URL
+
+
 def cmd_init(ctx):
     args = ctx.args
     repo, repo_source, repo_notes = choose_repo(ctx, args)
@@ -1432,6 +1446,17 @@ def cmd_init(ctx):
         die("refusing repo path %s: %s" % (repo, problem))
     if os.environ.get("SKILLKIT_HOME") and not ctx._within(repo, ctx.home):
         die("sandbox mode: SKILLKIT_HOME is set, so the repo must stay inside %s (got %s)" % (ctx.home, repo))
+
+    # Pre-load template & self metadata BEFORE any move/replace of SELF_SKILL_ROOT
+    template_path = SELF_SKILL_ROOT / "assets" / "repo-readme-template.md"
+    readme_template_text = template_path.read_text(encoding="utf-8") if template_path.is_file() else ""
+    self_name = _self_skill_name()
+    self_upstream = _self_upstream_url()
+    adopt_self = (
+        not bool(getattr(args, "no_adopt_self", False))
+        and is_skill_dir(SELF_SKILL_ROOT)
+        and not path_within(SELF_SKILL_ROOT, repo / "skills")
+    )
 
     ctx.log("== skillkit init ==")
     ctx.log("repo        : %s   [%s]" % (repo, repo_source))
@@ -1470,9 +1495,8 @@ def cmd_init(ctx):
             ctx.config["auto_push"] = True
         ctx.save_config()
         readme = repo / "README.md"
-        template = SELF_SKILL_ROOT / "assets" / "repo-readme-template.md"
-        if not readme.is_file() and template.is_file():
-            readme.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        if not readme.is_file() and readme_template_text:
+            readme.write_text(readme_template_text, encoding="utf-8")
 
     # remote handling
     if remote_url:
@@ -1525,7 +1549,34 @@ def cmd_init(ctx):
 
     plan_import, plan_skip, plan_backup, plan_foreign = [], [], [], []
     repo_by_name = {s["name"]: s for s in existing}
+    self_plan = None
+    self_step_aside = []
+    if adopt_self:
+        self_real_in_agent = [
+            c for c in groups.get(self_name, [])
+            if c.get("kind") == "dir" and c.get("is_self")
+        ]
+        if self_name not in existing_names:
+            self_plan = {
+                "name": self_name,
+                "src": SELF_SKILL_ROOT,
+                "dest": repo / "skills" / self_name,
+                "upstream": self_upstream,
+                "in_agent_dirs": self_real_in_agent,
+            }
+        elif self_real_in_agent:
+            self_step_aside = self_real_in_agent
+
     for name, copies in sorted(groups.items()):
+        if adopt_self and name == self_name:
+            # Handle skill-manager itself via self_plan / self_step_aside (keep any non-self duplicates in plan_backup)
+            other_real = [c for c in copies if c.get("kind") == "dir" and not c.get("is_self") and not c.get("managed_by")]
+            for c in other_real:
+                c["same_as_repo"] = False
+                plan_backup.append(c)
+            if self_name in existing_names and not self_step_aside and not other_real:
+                plan_skip.append((name, "already in repo (skill-manager)", copies[0]))
+            continue
         rejected = [c for c in copies if c.get("managed_by")]
         real = [c for c in copies if c.get("kind") == "dir" and not c.get("managed_by")]
         if rejected:
@@ -1534,7 +1585,7 @@ def cmd_init(ctx):
             if any(c.get("own") for c in copies):
                 why = "already linked to this repo"
             elif any(c.get("is_self") for c in copies):
-                why = "skill-manager itself"
+                why = "skill-manager itself (--no-adopt-self)"
             elif rejected:
                 why = rejected[0]["managed_by"]
             else:
@@ -1566,7 +1617,13 @@ def cmd_init(ctx):
                     plan_skip.append((name, "divergent copy kept as-is (--no-dedupe)", c))
 
     ctx.log("\n[3/5] plan")
-    ctx.log("  import : %d" % len(plan_import))
+    total_imports = len(plan_import) + (1 if self_plan else 0)
+    ctx.log("  import : %d" % total_imports)
+    if self_plan:
+        note_self = " [self: strip .git, record upstream]"
+        if self_plan["in_agent_dirs"]:
+            note_self += " (will replace %s with link)" % self_plan["in_agent_dirs"][0]["path"]
+        ctx.log("    + %-26s <- self (%s)%s" % (self_plan["name"], self_plan["src"], note_self))
     for item in plan_import:
         c = item["canonical"]
         conflict = len(item["variants"]) > 1
@@ -1578,9 +1635,9 @@ def cmd_init(ctx):
                 ctx.log("        %s %d copy(ies), newest %s, e.g. %s" % (
                     mark, len(group), human_time(max(x["mtime"] for x in group)), group[0]["path"]))
             ctx.log("        (policy: --prefer %s; losers are backed up, not destroyed)" % prefer)
-    if plan_backup:
-        ctx.log("  replace+backup : %d duplicate copies -> %s/backup/" % (len(plan_backup), STATE_DIR))
-        for c in plan_backup:
+    if plan_backup or self_step_aside:
+        ctx.log("  replace+backup : %d copy(ies) -> %s/backup/" % (len(plan_backup) + len(self_step_aside), STATE_DIR))
+        for c in plan_backup + self_step_aside:
             ctx.log("    ~ %-26s %s (%s)" % (c["name"], c["path"], human_time(c["mtime"])))
     if plan_skip:
         ctx.log("  skip   : %d" % len(plan_skip))
@@ -1601,6 +1658,65 @@ def cmd_init(ctx):
     if ctx.apply:
         ctx.log("\n[4/5] migrating")
         backup_root = repo / STATE_DIR / "backup" / stamp
+        if self_plan:
+            s_src = Path(self_plan["src"])
+            s_dest = Path(self_plan["dest"])
+            if not s_dest.exists():
+                backup_dst = _unique_path(backup_root / "self", self_plan["name"])
+                copy_tree(s_src, backup_dst, keep_git=True)
+                ctx.state.setdefault("backups", []).append({
+                    "name": self_plan["name"], "from": str(s_src), "backup": str(backup_dst), "at": stamp,
+                })
+                # Always copy WITHOUT .git (avoids nested .git and preserves standalone dev clones)
+                copy_tree(s_src, s_dest, keep_git=False)
+                ctx.config.setdefault("sources", {})[self_plan["name"]] = self_plan["upstream"]
+                ctx.save_config()
+                ctx.log("  + %s (adopted from self; .git stripped, upstream saved)" % self_plan["name"])
+                moved += 1
+            for c in self_plan["in_agent_dirs"]:
+                orig = Path(c["path"])
+                if not orig.exists() or is_skill_link(orig):
+                    continue
+                if args.copy:
+                    copy_kept_paths.add(_norm_path(orig))
+                    continue
+                if path_within(os.getcwd(), orig):
+                    try:
+                        os.chdir(str(repo))
+                    except OSError:
+                        pass
+                trash = _unique_path(repo / STATE_DIR / "trash" / stamp / c["env"], "%s@%s" % (c["name"], c["target_id"]))
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(orig), str(trash))
+                    ctx.log("  ~ replaced running self dir %s -> link" % orig)
+                except (OSError, shutil.Error) as exc:
+                    copy_kept_paths.add(_norm_path(orig))
+                    ctx.log("  ! could not move running dir %s (in use: %s)." % (orig, exc))
+                    ctx.log("    close any terminal inside it and re-run: python %s init --apply"
+                            % (s_dest / "scripts" / "skillkit.py"))
+        for c in self_step_aside:
+            orig = Path(c["path"])
+            if not orig.exists() or is_skill_link(orig):
+                continue
+            if args.copy:
+                copy_kept_paths.add(_norm_path(orig))
+                continue
+            if path_within(os.getcwd(), orig):
+                try:
+                    os.chdir(str(repo))
+                except OSError:
+                    pass
+            backup_dst = _unique_path(backup_root / c["env"], "%s@%s" % (c["name"], c["target_id"]))
+            copy_tree(orig, backup_dst, keep_git=True)
+            trash = _unique_path(repo / STATE_DIR / "trash" / stamp / c["env"], "%s@%s" % (c["name"], c["target_id"]))
+            trash.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(orig), str(trash))
+                ctx.log("  ~ stepped aside self dir %s -> link" % orig)
+            except (OSError, shutil.Error) as exc:
+                copy_kept_paths.add(_norm_path(orig))
+                ctx.log("  ! could not move %s (in use: %s)" % (orig, exc))
         for item in plan_import:
             src = Path(item["canonical"]["path"])
             dest = repo / "skills" / item["name"]
@@ -1638,7 +1754,7 @@ def cmd_init(ctx):
                                         "identical to repo" if c.get("same_as_repo") else "backed up"))
         ctx.ensure_scaffolding()
         ctx.save_state()
-        if moved or plan_backup or git_dirty(repo):
+        if moved or plan_backup or self_step_aside or git_dirty(repo):
             git_commit(repo, "import: adopt %d skill(s) into skills-repo" % moved)
     else:
         ctx.log("\n[4/5] migration (skipped, dry-run)")
@@ -1650,13 +1766,13 @@ def cmd_init(ctx):
     created = errs = 0
     sync_res = None
     if not ctx.apply:
-        planned = len(skills) + len(plan_import)
+        planned = len(skills) + total_imports
         ctx.log("  would link %d skill(s) into: %s" % (
             planned, ", ".join(sorted({r["target"]["id"] for r in targets})) or "(none detected)"))
     else:
         created, errs = link_all(ctx, skills, targets, skip_paths=copy_kept_paths)
         if copy_kept_paths:
-            ctx.log("  note: --copy kept %d original real dir(s) untouched (skipped linking over them)" % len(copy_kept_paths))
+            ctx.log("  note: kept %d original real dir(s) untouched (skipped linking over them)" % len(copy_kept_paths))
         ctx.log("  linked %d, errors %d" % (created, errs))
         git_commit(repo, "link: refresh agent links")
         should_push = (bool(args.push) or bool(ctx.config.get("auto_push", True))) and not bool(getattr(args, "no_push", False))
@@ -1677,13 +1793,15 @@ def cmd_init(ctx):
     ctx.log("Next: 'skillkit doctor' to verify, 'skillkit list' to inspect.")
 
     if ctx.json:
+        imported_names = ([self_plan["name"]] if self_plan else []) + [i["name"] for i in plan_import]
         ctx.emit({
             "apply": ctx.apply,
             "repo": str(repo),
             "repo_source": repo_source,
-            "imported": [i["name"] for i in plan_import],
+            "imported": imported_names,
+            "self_adopted": bool(self_plan),
             "moved": moved,
-            "backed_up": [str(c["path"]) for c in plan_backup],
+            "backed_up": [str(c["path"]) for c in plan_backup + self_step_aside],
             "skipped": [{"name": n, "reason": w} for n, w, _ in plan_skip],
             "foreign": [{"name": c["name"], "path": str(c["path"]), "reason": c["managed_by"]} for c in plan_foreign],
             "targets": sorted({r["target"]["id"] for r in targets}),
@@ -1729,10 +1847,9 @@ def link_all(ctx, skills, targets, mode_override=None, skip_paths=None):
                     errs += 1
                     continue
                 if not is_our_link(link, ctx.repo):
-                    if is_self_skill(link):
+                    if not is_self_skill(link):
+                        ctx.log("  ! %s is a link managed by another tool -> left untouched" % link)
                         continue
-                    ctx.log("  ! %s is a link managed by another tool -> left untouched" % link)
-                    continue
                 remove_link(link)
             try:
                 kind = make_link(sk["path"], link, mode=mode, env=tr["env"])
@@ -2662,6 +2779,8 @@ def build_parser():
     sp.add_argument("--no-dedupe", action="store_true", help="keep differing duplicate copies untouched")
     sp.add_argument("--prefer", choices=["newest", "majority"], default="newest",
                     help="conflict policy when the same skill differs between agents (default: newest)")
+    sp.add_argument("--no-adopt-self", action="store_true",
+                    help="keep skill-manager outside skills-repo (do not copy it into skills/)")
     sp.add_argument("--push", action="store_true", help="push after importing")
     sp.add_argument("--no-push", action="store_true", help="skip automatic push to GitHub remote")
     sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")

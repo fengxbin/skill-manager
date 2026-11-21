@@ -93,7 +93,8 @@ deterministically instead of being reinterpreted:
 skillkit.py install   [--to ...] [--mode auto|symlink|junction|copy] [--include-windows] [--apply]
                                                # link skill-manager itself into all detected agent dirs
 skillkit.py init      [--apply] [--repo-url URL | --create-remote] [--include-windows]
-                      [--prefer newest|majority] [--no-dedupe] [--copy] [--push | --no-push]
+                      [--prefer newest|majority] [--no-dedupe] [--copy] [--no-adopt-self]
+                      [--push | --no-push]
 skillkit.py scan      [--env local|windows|all] [--include-windows] [--json]
 skillkit.py repo      [--set PATH | --forget]  # which local skills-repo this machine uses
 skillkit.py targets   [--json]                 # which agent dirs exist on this machine
@@ -133,6 +134,7 @@ Testing hook: `SKILLKIT_HOME` overrides `$HOME` for target discovery.
 3. `... init --repo ~/skills-repo` — dry run. Read out: repo path, imports, conflicts with
    both sides (path + date), duplicates to be backed up, target dirs.
 4. Ask for confirmation. Then `... init --repo ~/skills-repo --apply` (with `--repo-url <url>` or `--create-remote`).
+   - Adopts `skill-manager` itself into `skills-repo/skills/skill-manager` (strips `.git`, records upstream URL in `sources`, replaces agent-dir copy with link; pass `--no-adopt-self` to opt out).
    - Writes `skill-manager.json` (with `auto_push: true`), creates universal hubs (`~/.agents/skills`, `~/.config/agents/skills`), links every detected target, commits, and pushes if a remote is configured.
    - No `gh` CLI → `init` prints the two `git remote add` / `git push` lines; relay them.
    - Dual WSL + Windows → repo on a Windows drive (`/mnt/d/skills-repo`) + `--include-windows`, then run `restore --apply` on the Windows side as well.

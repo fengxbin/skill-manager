@@ -39,43 +39,48 @@
 
 环境要求：**Python 3.8+**（纯标准库，无需安装任何第三方依赖）和 **Git**。
 
-### 第 1 步：安装 `skill-manager`（一条命令自动挂载到本机所有 Agent）
+### 第 1 步：装上 `skill-manager`（两种方式任选其一）
 
-`skill-manager` 本身也是一个 skill，需要出现在 Agent 默认的技能目录里才能被识别。你**不需要**手动给每个工具敲 `ln -s` 或 `mklink`——直接运行内置的 `install --apply`，它会自动探测本机已安装的所有 Agent 默认目录（以及通用目录 `~/.agents/skills`）并一次性自动建好链接：
+#### 方式 A：直接让任意一个 Agent 装（最省事）
 
-#### macOS / Linux
+直接对你常用的 Agent（如 Codex、Claude Code、Cursor）说：
+**「帮我安装这个 skill：`https://github.com/fengxbin/skill-manager.git`」**
+
+它会先装到该 Agent 自己的默认技能目录（例如 `~/.codex/skills/skill-manager`）。新开会话后直接说「帮我初始化 `skills-repo`」，`init --apply` 会**自动把 `skill-manager` 自己也安全收编进 `skills-repo/skills/skill-manager`**（自动剥离嵌套 `.git`、记录上游地址用于日后 `update`），再把原目录换成链接，并一次性分发给本机所有其他 Agent。
+
+#### 方式 B：用命令行克隆并一键挂载
 
 ```bash
+# macOS / Linux
 git clone https://github.com/fengxbin/skill-manager.git ~/skill-manager
 python3 ~/skill-manager/scripts/skillkit.py install --apply
-
-# （可选）把 CLI 加到 PATH，以后可直接敲 skillkit
-mkdir -p ~/.local/bin && ln -sf ~/skill-manager/scripts/skillkit.py ~/.local/bin/skillkit
 ```
 
-#### Windows（PowerShell，无需管理员权限）
-
 ```powershell
+# Windows（PowerShell，无需管理员权限）
 git clone https://github.com/fengxbin/skill-manager.git "$env:USERPROFILE\skill-manager"
 python "$env:USERPROFILE\skill-manager\scripts\skillkit.py" install --apply
 ```
 
-#### WSL + Windows 共用（推荐放 D 盘，两边都能访问）
-
-Windows 读不到 WSL 内部目录（`~/`），所以放在 `D:` 盘，一条命令同时挂载 WSL 与 Windows 两侧的 Agent：
-
 ```bash
+# WSL + Windows 共用（放 D 盘，一条命令同时挂两边）
 git clone https://github.com/fengxbin/skill-manager.git /mnt/d/skill-manager
 python3 /mnt/d/skill-manager/scripts/skillkit.py install --include-windows --apply
 ```
 
-> **只用单一工具？** 也可以直接 `git clone` 到该工具默认的技能目录（例如 `~/.claude/skills/skill-manager`），连 `install` 都不用跑；之后若想让其他工具也共用，再跑一次 `install --apply` 即可。
+> `install --apply` 只是把 `skill-manager` 自动链接到本机所有已安装 Agent 的默认目录（以及 `~/.agents/skills`）。之后执行 `init --apply` 时，`skill-manager` 会被自动收编进 `skills-repo/skills/skill-manager`，所有 Agent 链接也会自动切到 `skills-repo`（若你是开发者想保持独立仓库，可传 `--no-adopt-self`）。
 
 完成后**新开一个 Agent 会话**，Agent 就能识别 `skill-manager`。
 
 ---
 
 ### 第 2 步：初始化 `skills-repo` 并绑定 GitHub
+
+**`skills-repo` 默认建在哪里？**
+- **Linux / macOS**：`~/skills-repo`
+- **Windows**：`%USERPROFILE%\skills-repo`（如 `C:\Users\<你>\skills-repo`）
+- **WSL**：优先第一个可用的 Windows 数据盘 `/mnt/d/skills-repo`（依次探测 `d/e/f/g`，若只有 C 盘则落到 `/mnt/c/Users/<你>/skills-repo`），确保 WSL 和 Windows 两侧共用同一份仓库
+- 在交互终端跑 `init` 时会让你确认一次（直接回车用默认，也可输入任意自定义路径），之后记住在 `~/.config/skillkit/location`，后续命令无需再传 `--repo`。
 
 你可以直接对 Agent 说：**「帮我盘点本机所有技能，然后初始化 skills-repo 并关联到我的 GitHub 私有仓库」**。
 
@@ -176,10 +181,11 @@ skills-repo/
 ## 常见问题
 
 **Q：换了一台新电脑怎么快速恢复所有技能？**
+因为 `skill-manager` 已经被一起收编进 `skills-repo`，换机只需要克隆 `skills-repo` **一个仓库**：
 ```bash
 git clone git@github.com:<你的用户名>/skills-repo.git ~/skills-repo
-python3 ~/skill-manager/scripts/skillkit.py restore --repo ~/skills-repo --apply
-python3 ~/skill-manager/scripts/skillkit.py doctor
+python3 ~/skills-repo/skills/skill-manager/scripts/skillkit.py restore --repo ~/skills-repo --apply
+python3 ~/skills-repo/skills/skill-manager/scripts/skillkit.py doctor
 ```
 
 **Q：如何修改一个已有技能？**

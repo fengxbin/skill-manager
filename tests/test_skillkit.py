@@ -294,7 +294,8 @@ class SkillkitTest(unittest.TestCase):
         bare = make_bare_remote(self.tmp)
         self.run_cli("init", "--repo-url", bare.resolve().as_uri(), "--apply")
 
-        secret_skill = make_skill(self.tmp / "leaky", "leaky", body="token: ghp_1234567890abcdefghijklmno")
+        fake_token = "ghp_" + "1234567890abcdefghijklmno"
+        secret_skill = make_skill(self.tmp / "leaky", "leaky", body="token: " + fake_token)
         r_add = self.run_cli("add", str(secret_skill), "--apply", "--json")
         res = json.loads(r_add.stdout)
         self.assertEqual(res["sync"]["status"], "blocked")
@@ -409,12 +410,77 @@ class SkillkitTest(unittest.TestCase):
         self.assertEqual(res2["linked"], 0)
         self.assertGreaterEqual(res2["skipped"], 4)
 
-        # After init, doctor must report 0 problems and no false warning for skill-manager
+        # After init, skill-manager is adopted into skills-repo and links are upgraded;
+        # doctor must report 0 problems and no false warning for skill-manager
         make_skill(self.home / ".claude" / "skills" / "demo", "demo", body="demo")
         self.run_cli("init", "--apply")
+        repo = self.home / "skills-repo"
+        self.assertTrue((repo / "skills" / "skill-manager" / "SKILL.md").is_file())
+        self.assertFalse((repo / "skills" / "skill-manager" / ".git").exists())
         doc = json.loads(self.run_cli("doctor", "--json").stdout)
         self.assertTrue(doc["ok"], doc)
         self.assertFalse(any("skill-manager" in w for w in doc["warnings"]), doc["warnings"])
+
+    def test_codex_direct_install_self_adopted_into_skills_repo(self):
+        """Simulate Codex installing skill-manager directly into ~/.codex/skills/skill-manager
+        (complete with a .git folder), then running init --apply from inside it."""
+        import shutil
+        codex_sm = self.home / ".codex" / "skills" / "skill-manager"
+        (self.home / ".claude" / "skills").mkdir(parents=True)
+        shutil.copytree(
+            str(ROOT), str(codex_sm),
+            ignore=shutil.ignore_patterns(".git", "__pycache__", ".skill-manager"),
+        )
+        # Put a real git repo inside codex_sm to simulate `git clone` by Codex
+        subprocess.run(["git", "init", str(codex_sm)], check=True, capture_output=True)
+        git_run(codex_sm, "remote", "add", "origin", "https://github.com/fengxbin/skill-manager.git")
+
+        # Run init --apply using the copy living INSIDE ~/.codex/skills/skill-manager!
+        codex_cli = codex_sm / "scripts" / "skillkit.py"
+        r = subprocess.run(
+            [sys.executable, str(codex_cli), "init", "--apply", "--json"],
+            env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(r.returncode, 0, "STDOUT:\n%s\nSTDERR:\n%s" % (r.stdout, r.stderr))
+        data = json.loads(r.stdout)
+        self.assertTrue(data["self_adopted"])
+        self.assertIn("skill-manager", data["imported"])
+
+        repo = self.home / "skills-repo"
+        adopted = repo / "skills" / "skill-manager"
+        self.assertTrue((adopted / "SKILL.md").is_file())
+        # .git must be stripped so skills-repo has no broken nested gitlink
+        self.assertFalse((adopted / ".git").exists())
+
+        # Upstream URL must be saved in skill-manager.json.sources
+        cfg = json.loads((repo / "skill-manager.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["sources"].get("skill-manager"), "https://github.com/fengxbin/skill-manager.git")
+
+        # ~/.codex/skills/skill-manager must now be a link pointing to skills-repo/skills/skill-manager
+        self.assertTrue(codex_sm.is_symlink() or _is_junction(codex_sm))
+        self.assertTrue((codex_sm / "SKILL.md").is_file())
+        # Other agents (claude + universal hub) also received links automatically
+        self.assertTrue((self.home / ".claude" / "skills" / "skill-manager" / "SKILL.md").is_file())
+        self.assertTrue((self.home / ".agents" / "skills" / "skill-manager" / "SKILL.md").is_file())
+
+        # Doctor run from the adopted copy reports 0 problems
+        r_doc = subprocess.run(
+            [sys.executable, str(adopted / "scripts" / "skillkit.py"), "doctor", "--json"],
+            env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(r_doc.returncode, 0, r_doc.stderr)
+        doc = json.loads(r_doc.stdout)
+        self.assertTrue(doc["ok"], doc)
+        self.assertEqual(doc["problems"], [])
+
+    def test_init_no_adopt_self_keeps_skill_manager_external(self):
+        make_skill(self.home / ".claude" / "skills" / "solo", "solo", body="solo")
+        r = self.run_cli("init", "--no-adopt-self", "--apply", "--json")
+        data = json.loads(r.stdout)
+        self.assertFalse(data["self_adopted"])
+        self.assertFalse((self.home / "skills-repo" / "skills" / "skill-manager").exists())
+        doc = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertTrue(doc["ok"], doc)
 
 
 if __name__ == "__main__":

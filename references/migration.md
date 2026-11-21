@@ -44,11 +44,11 @@ python3 scripts/skillkit.py scan --include-windows --json
 
 | 用户情况 | 仓库路径 |
 |---|---|
-| 只有 Linux / macOS | `~/skills_repo` |
-| Windows 单环境 | `%USERPROFILE%\skills_repo` |
-| WSL + Windows 双环境 | Windows 可见盘，如 `/mnt/d/skills_repo`（Windows 侧是 `D:\skills_repo`） |
+| 只有 Linux / macOS | `~/skills-repo` |
+| Windows 单环境 | `%USERPROFILE%\skills-repo` |
+| WSL + Windows 双环境 | Windows 可见盘，如 `/mnt/d/skills-repo`（Windows 侧是 `D:\skills-repo`） |
 
-WSL 下若用户坚持放 `~/skills_repo`（ext4），明确告知：Windows 侧 Agent 拿不到这批技能。
+WSL 下若用户坚持放 `~/skills-repo`（ext4），明确告知：Windows 侧 Agent 拿不到这批技能。
 
 ## 4. 远端仓库（私有）
 
@@ -64,11 +64,11 @@ git clone <url> <repo-path>        # 或 init 时带 --repo-url <url>
 # gh 已认证（gh = GitHub 官方 CLI）
 python3 scripts/skillkit.py init --repo <path> --create-remote --apply
 # 无 gh：由 init 打印两条命令，交给用户执行
-git -C <path> remote add origin git@github.com:<user>/skills_repo.git
+git -C <path> remote add origin git@github.com:<user>/skills-repo.git
 git -C <path> push -u origin HEAD
 ```
 
-`gh repo view <user>/skills_repo` 能查到就直接 clone，不要重复创建。
+`gh repo view <user>/skills-repo` 能查到就直接 clone，不要重复创建。
 
 ## 5. 迁移（唯一的破坏性步骤，且只是"移动"）
 

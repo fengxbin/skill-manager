@@ -129,7 +129,7 @@
 **跨边界规则**
 
 - WSL 可以读 Windows 目录（`/mnt/c/...`），所以 `init --include-windows` 能收编 Windows 侧的技能。
-- Windows 读不到 WSL 的 ext4，所以仓库要放在 Windows 可见盘（`/mnt/d/skills_repo` ↔ `D:\skills_repo`）。
+- Windows 读不到 WSL 的 ext4，所以仓库要放在 Windows 可见盘（`/mnt/d/skills-repo` ↔ `D:\skills-repo`）。
 - 每个环境的链接在各自环境内创建：WSL 建 symlink，Windows 建 junction；两端各自维护独立的状态文件
   `state-<platform>-<host>.json`，互不覆盖。
 

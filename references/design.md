@@ -93,12 +93,12 @@
 | 1 | `--repo PATH` | 显式指定，最高优先 |
 | 2 | `SKILLKIT_REPO` 环境变量 | CI、多仓库切换 |
 | 3 | `~/.config/skillkit/location` | `init` / `restore` 成功后写入；`repo --set/--forget` 管理 |
-| 4 | 自动探测 | `~/skills_repo`（并兼容旧名 `~/skills-repo`）、cwd 里的 `skill-manager.json` / `skills/` + `.git` |
+| 4 | 自动探测 | `~/skills-repo`（并兼容 `~/skills_repo`）、cwd 里的 `skill-manager.json` / `skills/` + `.git` |
 
 推荐值（`init` 会打印理由）：
 
-- WSL + 探测到 Windows profile → `/mnt/<第一个可用非 C: 盘>/skills_repo`（Windows 可见盘才两边都能用）
-- 其它 → `<home>/skills_repo`
+- WSL + 探测到 Windows profile → `/mnt/<第一个可用非 C: 盘>/skills-repo`（Windows 可见盘才两边都能用）
+- 其它 → `<home>/skills-repo`
 
 只在 `init`、只在交互终端、且优先值尚未记录时弹菜单；`--json` / `-y` / `CI` / 非 TTY 直接用推荐值并打印。
 路径安全校验：不得落在某 Agent 的 skills 目录内、不得是 `skills/` 目录本身、不得在 OneDrive/Dropbox/iCloud 里。

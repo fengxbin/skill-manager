@@ -4,7 +4,7 @@
 
 ## Skill 管理
 
-本机所有 Agent 技能由 `skill-manager` 统一管理：一个 Git 仓库（默认 `~/skills_repo`）是唯一真相源，
+本机所有 Agent 技能由 `skill-manager` 统一管理：一个 Git 仓库（默认 `~/skills-repo`）是唯一真相源，
 各 Agent 目录里只有指向它的链接（零复制、零漂移）。已知 73 种 Agent 目录
 （Claude Code / Codex / Pi / DSH / Gemini / Antigravity / Copilot / Cursor / Windsurf /
 Cline / Roo / Kilo / OpenCode / Kimi / Qwen / 通义灵码 / iFlow / Qoder / CodeBuddy / CodeArts /
@@ -15,7 +15,7 @@ ZCode / MiniMax / Trae …）。
   `~/.agents/skills`、`~/.copilot/skills`、`~/.gemini/antigravity/skills` 等目录写文件。
 - **自动同步 GitHub**：`add` / `update` / `remove` 提交后会自动推送到已配置的 GitHub 远端
   （推送前自动做密钥扫描；传 `--no-push` 可临时跳过）。
-- **修改技能**：在 `~/skills_repo/skills/<name>/` 里改，不要在 Agent 目录里改（那里是链接），
+- **修改技能**：在 `~/skills-repo/skills/<name>/` 里改，不要在 Agent 目录里改（那里是链接），
   改完运行 `skillkit.py push --apply` 同步到 GitHub。
 - **同名冲突**：以**最新修改时间**的那份为准；其余备份到 `.skill-manager/backup/`。
   不要手工猜测版本。

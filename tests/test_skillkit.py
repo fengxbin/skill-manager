@@ -15,12 +15,46 @@ ROOT = Path(__file__).resolve().parent.parent
 SKILLKIT = ROOT / "scripts" / "skillkit.py"
 
 
+def _is_junction(p):
+    p = Path(p)
+    if p.is_symlink():
+        return False
+    if os.name == "nt":
+        import ctypes
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(p))
+        return bool(attrs != -1 and (attrs & 0x400) and (attrs & 0x10))
+    return False
+
+
 def _force_remove_tree(path):
-    """Test teardown helper (handles Windows read-only git pack files & junctions)."""
+    """Test teardown helper (handles Windows read-only git files & NEVER follows junctions)."""
     path = Path(path)
-    if not path.exists() and not path.is_symlink():
+    if path.is_symlink():
+        os.unlink(str(path))
         return
-    for cur, dirs, files in os.walk(str(path), topdown=False):
+    if _is_junction(path):
+        os.rmdir(str(path))
+        return
+    if not path.exists():
+        return
+    dirs_to_remove = []
+    for cur, dirs, files in os.walk(str(path), topdown=True, followlinks=False):
+        safe_dirs = []
+        for d in dirs:
+            dp = os.path.join(cur, d)
+            if os.path.islink(dp):
+                try:
+                    os.unlink(dp)
+                except OSError:
+                    pass
+            elif _is_junction(dp):
+                try:
+                    os.rmdir(dp)
+                except OSError:
+                    pass
+            else:
+                safe_dirs.append(d)
+        dirs[:] = safe_dirs
         for name in files:
             fp = os.path.join(cur, name)
             try:
@@ -30,19 +64,12 @@ def _force_remove_tree(path):
                 os.unlink(fp)
             except OSError:
                 pass
-        for d in dirs:
-            dp = os.path.join(cur, d)
-            try:
-                if os.path.islink(dp):
-                    os.unlink(dp)
-                else:
-                    os.rmdir(dp)
-            except OSError:
-                pass
-    try:
-        os.rmdir(str(path))
-    except OSError:
-        pass
+        dirs_to_remove.append(cur)
+    for d in reversed(dirs_to_remove):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
 
 
 def make_skill(dir_path, name, body="hello", mtime=None):
@@ -132,17 +159,17 @@ class SkillkitTest(unittest.TestCase):
         make_skill(self.home / ".pi" / "agent" / "skills" / "alpha", "alpha", body="pi-old-1", mtime=now - 7200)
         make_skill(self.home / ".pi" / "skills" / "alpha", "alpha", body="pi-old-2", mtime=now - 7000)
 
-        # Dry-run should not create skills_repo
+        # Dry-run should not create skills-repo
         r_dry = self.run_cli("init", "--json")
         dry_data = json.loads(r_dry.stdout)
         self.assertFalse(dry_data["apply"])
-        self.assertFalse((self.home / "skills_repo").exists())
+        self.assertFalse((self.home / "skills-repo").exists())
 
         # Apply
         r = self.run_cli("init", "--apply", "--json")
         data = json.loads(r.stdout)
         self.assertTrue(data["apply"])
-        repo = self.home / "skills_repo"
+        repo = self.home / "skills-repo"
         self.assertTrue(repo.is_dir())
         self.assertTrue((repo / "skill-manager.json").is_file())
         cfg = json.loads((repo / "skill-manager.json").read_text(encoding="utf-8"))
@@ -172,7 +199,7 @@ class SkillkitTest(unittest.TestCase):
         (foreign / "skills-lock.json").write_text("{}", encoding="utf-8")
 
         self.run_cli("init", "--apply")
-        repo = self.home / "skills_repo"
+        repo = self.home / "skills-repo"
         # Repo must have adopted the older adoptable copy, NOT the foreign one
         self.assertIn("adoptable-older", (repo / "skills" / "beta" / "SKILL.md").read_text(encoding="utf-8"))
         # Foreign directory in codex must still be untouched with its lock file
@@ -188,7 +215,7 @@ class SkillkitTest(unittest.TestCase):
         # Init repo attached to bare remote
         make_skill(self.home / ".claude" / "skills" / "seed", "seed", body="seed")
         self.run_cli("init", "--repo-url", remote_url, "--apply")
-        repo = self.home / "skills_repo"
+        repo = self.home / "skills-repo"
 
         # Verify init auto-pushed to remote
         remote_log = git_run(bare, "log", "--oneline", "--all")
@@ -347,13 +374,47 @@ class SkillkitTest(unittest.TestCase):
         r_purge = self.run_cli("trash", "--purge", "eps", "--confirm-delete", "-y", "--json")
         self.assertGreaterEqual(json.loads(r_purge.stdout)["deleted"], 1)
 
-    def test_legacy_skills_repo_hyphen_autodetect(self):
-        legacy = self.home / "skills-repo"
-        make_skill(legacy / "skills" / "old", "old", body="legacy")
-        subprocess.run(["git", "init", str(legacy)], check=True, capture_output=True)
+    def test_alt_skills_repo_underscore_autodetect(self):
+        alt = self.home / "skills_repo"
+        make_skill(alt / "skills" / "old", "old", body="alt")
+        subprocess.run(["git", "init", str(alt)], check=True, capture_output=True)
         r = self.run_cli("repo", "--json")
         info = json.loads(r.stdout)
-        self.assertEqual(Path(info["repo"]).resolve(), legacy.resolve())
+        self.assertEqual(Path(info["repo"]).resolve(), alt.resolve())
+
+    def test_install_self_links_all_detected_agents_and_doctor_clean(self):
+        # Simulate two installed agents
+        (self.home / ".claude" / "skills").mkdir(parents=True)
+        (self.home / ".codex" / "skills").mkdir(parents=True)
+
+        # Dry-run must not create links
+        r_dry = self.run_cli("install", "--json")
+        dry = json.loads(r_dry.stdout)
+        self.assertFalse(dry["apply"])
+        self.assertFalse((self.home / ".claude" / "skills" / "skill-manager").exists())
+
+        # Apply installs into all detected agent dirs + universal hubs in one shot
+        r = self.run_cli("install", "--apply", "--json")
+        res = json.loads(r.stdout)
+        self.assertTrue(res["apply"])
+        self.assertEqual(res["errors"], 0)
+        self.assertGreaterEqual(res["linked"], 4)  # claude, codex, agents, config-agents
+        self.assertTrue((self.home / ".claude" / "skills" / "skill-manager" / "SKILL.md").is_file())
+        self.assertTrue((self.home / ".codex" / "skills" / "skill-manager" / "SKILL.md").is_file())
+        self.assertTrue((self.home / ".agents" / "skills" / "skill-manager" / "SKILL.md").is_file())
+
+        # Idempotent re-run
+        r2 = self.run_cli("install", "--apply", "--json")
+        res2 = json.loads(r2.stdout)
+        self.assertEqual(res2["linked"], 0)
+        self.assertGreaterEqual(res2["skipped"], 4)
+
+        # After init, doctor must report 0 problems and no false warning for skill-manager
+        make_skill(self.home / ".claude" / "skills" / "demo", "demo", body="demo")
+        self.run_cli("init", "--apply")
+        doc = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertTrue(doc["ok"], doc)
+        self.assertFalse(any("skill-manager" in w for w in doc["warnings"]), doc["warnings"])
 
 
 if __name__ == "__main__":

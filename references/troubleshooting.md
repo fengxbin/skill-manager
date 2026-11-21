@@ -5,14 +5,14 @@
 `gh` 是 **GitHub 官方的命令行客户端**（GitHub CLI，<https://cli.github.com>）：
 
 - `gh auth login` → 登录（存 token）
-- `gh repo create <you>/skills_repo --private --source=.` → 一条命令建私有仓库
-- `gh repo view <you>/skills_repo` / `gh api user --jq .login` → 查仓库、查用户名
+- `gh repo create <you>/skills-repo --private --source=.` → 一条命令建私有仓库
+- `gh repo view <you>/skills-repo` / `gh api user --jq .login` → 查仓库、查用户名
 
 **没装完全可以**：本工具只在 `gh` 存在**且** `gh auth status` 通过时才用它。
 否则 `init` 打印两行手动命令：
 
 ```bash
-git -C <repo> remote add origin git@github.com:<you>/skills_repo.git
+git -C <repo> remote add origin git@github.com:<you>/skills-repo.git
 git -C <repo> push -u origin HEAD
 ```
 
@@ -86,10 +86,10 @@ python3 scripts/skillkit.py link --mode copy     --apply   # 最后手段，会�
 读：可以。写链接：可以，但必须 junction，且仓库要在 Windows 可见盘：
 
 ```bash
-python3 scripts/skillkit.py init --repo /mnt/d/skills_repo --include-windows --apply
+python3 scripts/skillkit.py init --repo /mnt/d/skills-repo --include-windows --apply
 ```
 
-**仓库在 `~/skills_repo`（ext4）会怎样？**
+**仓库在 `~/skills-repo`（ext4）会怎样？**
 
 Linux 侧正常；Windows 侧看不到，`init` 会提示，Windows 目标不会被链接。
 
@@ -172,7 +172,7 @@ python3 scripts/skillkit.py trash --purge old-skill --confirm-delete   # 额外�
 
 ```bash
 python3 scripts/skillkit.py repo                 # 当前路径 + 来源（flag / 环境变量 / 记录 / 默认）+ 推荐值
-python3 scripts/skillkit.py repo --set /mnt/d/skills_repo
+python3 scripts/skillkit.py repo --set /mnt/d/skills-repo
 python3 scripts/skillkit.py repo --forget
 ```
 

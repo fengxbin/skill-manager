@@ -1,4 +1,4 @@
-# skills_repo
+# skills-repo
 
 我所有 AI 编程 Agent 技能的**唯一真相源**。
 
@@ -17,7 +17,7 @@ Warp、Amp、Augment、Continue、AiderDesk、Tabnine、Zencoder、**Kimi Code C
 ## 目录结构
 
 ```text
-skills_repo/
+skills-repo/
 ├── README.md              # 本文件
 ├── skill-manager.json     # 目标 Agent、链接模式、冲突策略、auto_push、上游来源
 ├── skills/
@@ -66,9 +66,9 @@ skillkit push -m "update <name>" --apply
 ```bash
 # POSIX 手工等价写法（脚本会自动做，这里只是备查）
 mkdir -p ~/.claude/skills
-ln -s ~/skills_repo/skills/<name> ~/.claude/skills/<name>
+ln -s ~/skills-repo/skills/<name> ~/.claude/skills/<name>
 # Windows：junction，无需管理员权限
-cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills_repo\skills\<name>"
+cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills-repo\skills\<name>"
 ```
 
 ## 规则
@@ -82,21 +82,21 @@ cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills_repo\skills\<na
 ## 迁移到新机器
 
 ```bash
-# 1. 克隆仓库（WSL + Windows 双环境：放在 Windows 可见盘，如 /mnt/d/skills_repo）
-git clone <repo-url> ~/skills_repo
+# 1. 克隆仓库（WSL + Windows 双环境：放在 Windows 可见盘，如 /mnt/d/skills-repo）
+git clone <repo-url> ~/skills-repo
 
 # 2. 重建全部链接（先 dry-run 看清单，再 --apply）
-skillkit restore --repo ~/skills_repo
-skillkit restore --repo ~/skills_repo --apply
+skillkit restore --repo ~/skills-repo
+skillkit restore --repo ~/skills-repo --apply
 
 # 3. 体检
-skillkit doctor --repo ~/skills_repo
+skillkit doctor --repo ~/skills-repo
 ```
 
 机器上已有"野生"技能目录时，用 `init` 而不是 `restore`（会先备份再迁移，冲突保留最新版本）：
 
 ```bash
-skillkit init --repo ~/skills_repo --apply
+skillkit init --repo ~/skills-repo --apply
 ```
 
 ## For Agents

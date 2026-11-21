@@ -1,11 +1,11 @@
 ---
 name: skill-manager
-description: One-repo (`skills_repo`), symlink-first manager for agent skills shared by many agents (Claude Code, Codex, Pi, Cursor, Gemini, Antigravity, Kimi, Qwen, CodeBuddy, ZCode, Trae, Copilot, Cline/Roo/Kilo, OpenCode, Windsurf, DSH, 70+ more) on Linux/macOS/Windows/WSL, with automatic GitHub sync on add/update/remove. Use when the user wants to install or adopt a skill, migrate scattered skills into one central Git repo (`skills_repo`), link/relink skills into agent directories, update/sync skills to GitHub, see where skills conflict, or diagnose broken links. Triggers - "安装这个 skill", "管理 skill", "迁移技能", "同步 skills", "skill 软链接", "skills_repo", "skills repo", "skill 冲突", "skill-manager".
+description: One-repo (`skills-repo`), symlink-first manager for agent skills shared by many agents (Claude Code, Codex, Pi, Cursor, Gemini, Antigravity, Kimi, Qwen, CodeBuddy, ZCode, Trae, Copilot, Cline/Roo/Kilo, OpenCode, Windsurf, DSH, 70+ more) on Linux/macOS/Windows/WSL, with automatic GitHub sync on add/update/remove. Use when the user wants to install or adopt a skill, migrate scattered skills into one central Git repo (`skills-repo`), link/relink skills into agent directories, update/sync skills to GitHub, see where skills conflict, or diagnose broken links. Triggers - "安装这个 skill", "管理 skill", "迁移技能", "同步 skills", "skill 软链接", "skills-repo", "skills repo", "skill 冲突", "skill-manager".
 ---
 
 # skill-manager
 
-One central Git repo (**`skills_repo`**) is the **single source of truth**; every agent directory gets a
+One central Git repo (**`skills-repo`**) is the **single source of truth**; every agent directory gets a
 **link** (symlink on POSIX, NTFS junction on Windows) — never a copy. Edit the repo once,
 every agent changes (**zero copy, zero drift**). Every `add` / `update` / `remove` automatically
 commits and pushes to the configured GitHub remote (guarded by secret scanning; pass `--no-push`
@@ -18,6 +18,7 @@ If it has been installed on PATH as `skillkit`, the examples below can drop the
 
 ## When to use
 
+- "mount skill-manager itself into all my Agents" → `install` (auto-detects every agent's default skill folder)
 - "install / download this skill from GitHub" → `add` (clones, strips `.git`, links all agents, auto-pushes to GitHub)
 - "update my installed skills" → `update` (re-fetches recorded git URLs, replaces safely, auto-pushes to GitHub)
 - "my skills are scattered across N directories" → `scan`, then `init`
@@ -43,15 +44,15 @@ If it has been installed on PATH as `skillkit`, the examples below can drop the
 5. **Skills already managed by another tool are skipped and reported.** External symlink/junction,
    `skills-lock.json`, `.skill-manager.json`, `install.json`, or an embedded `.git` → leave it,
    say so. Never adopt or overwrite (and never include them in conflict voting).
-6. **Never copy a skill into an agent directory.** Payload lives in `skills_repo`; agents get links.
+6. **Never copy a skill into an agent directory.** Payload lives in `skills-repo`; agents get links.
    `auto` mode never silently falls back to copy (`--mode copy` must be explicitly passed).
 7. **Never delete.** `remove` moves payloads to `<repo>/.skill-manager/trash/<ts>/`.
    Deletion (batch or recursive) is forbidden by the user's global rule: if it is ever
    genuinely needed, print the exact paths, ask the user, wait for confirmation, then — only
    with `trash --purge <entry> --confirm-delete` — delete one path at a time. Never `rm -rf`,
    `del /s`, `Remove-Item -Recurse`, `shutil.rmtree`.
-8. **Dry-run first.** Every mutating command (including `doctor --fix`) prints a plan and writes
-   nothing without `--apply`. Show the plan, get a yes, then re-run with `--apply`.
+8. **Dry-run first.** Every mutating command (including `install` and `doctor --fix`) prints a
+   plan and writes nothing without `--apply`. Show the plan, get a yes, then re-run with `--apply`.
 9. **Secret gate before push.** Auto-push and `push` scan for secrets first and block if any are
    found. Report the exact file and reason to the user; never pass `--allow-secrets` without asking.
 10. Prefer `--json` when you need to reason about the output (all commands emit valid JSON with `--json`).
@@ -89,10 +90,12 @@ deterministically instead of being reinterpreted:
 ## Command surface
 
 ```
+skillkit.py install   [--to ...] [--mode auto|symlink|junction|copy] [--include-windows] [--apply]
+                                               # link skill-manager itself into all detected agent dirs
 skillkit.py init      [--apply] [--repo-url URL | --create-remote] [--include-windows]
                       [--prefer newest|majority] [--no-dedupe] [--copy] [--push | --no-push]
 skillkit.py scan      [--env local|windows|all] [--include-windows] [--json]
-skillkit.py repo      [--set PATH | --forget]  # which local skills_repo this machine uses
+skillkit.py repo      [--set PATH | --forget]  # which local skills-repo this machine uses
 skillkit.py targets   [--json]                 # which agent dirs exist on this machine
 skillkit.py list      [--json]                 # repo skills + live links across targets
 skillkit.py status    [--json]                 # git state, auto_push, link counts
@@ -109,7 +112,7 @@ skillkit.py push      [-m MSG] [--allow-secrets] [--apply]
 skillkit.py pull      [--apply]                # git pull --rebase + prune dangling links + relink
 ```
 
-Global flags: `--repo PATH` (default `~/skills_repo`, backwards-compatible fallback `~/skills-repo`, override with `SKILLKIT_REPO`),
+Global flags: `--repo PATH` (default `~/skills-repo`, fallback `~/skills_repo`, override with `SKILLKIT_REPO`),
 `--json`, `--apply`, `-y`, `-v`, `--include-windows`, `--allow-cross-user`.
 Testing hook: `SKILLKIT_HOME` overrides `$HOME` for target discovery.
 
@@ -117,8 +120,8 @@ Testing hook: `SKILLKIT_HOME` overrides `$HOME` for target discovery.
 
 ### First-time setup (adopt everything this user has)
 
-0. **Where does `skills_repo` go?** Run `skillkit.py repo` — it prints the recommended path *and why*
-   (WSL+Windows → `/mnt/d/skills_repo`, a Windows-visible drive; single env → `~/skills_repo`).
+0. **Where does `skills-repo` go?** Run `skillkit.py repo` — it prints the recommended path *and why*
+   (WSL+Windows → `/mnt/d/skills-repo`, a Windows-visible drive; single env → `~/skills-repo`).
    `init` asks once in an interactive terminal (Enter = recommended) and then remembers the answer
    in `~/.config/skillkit/location`, so later commands need no `--repo`. Non-interactive runs
    (`--json`, `-y`, CI) never block: they take the recommended path and print it.
@@ -127,12 +130,12 @@ Testing hook: `SKILLKIT_HOME` overrides `$HOME` for target discovery.
 1. `python3 <skill>/scripts/skillkit.py targets` — confirm which agent dirs exist.
 2. `... scan --include-windows` — read-only inventory. Note every `<< CONFLICT`, every
    `[skip: managed by another tool]`, and the environment notes.
-3. `... init --repo ~/skills_repo` — dry run. Read out: repo path, imports, conflicts with
+3. `... init --repo ~/skills-repo` — dry run. Read out: repo path, imports, conflicts with
    both sides (path + date), duplicates to be backed up, target dirs.
-4. Ask for confirmation. Then `... init --repo ~/skills_repo --apply` (with `--repo-url <url>` or `--create-remote`).
+4. Ask for confirmation. Then `... init --repo ~/skills-repo --apply` (with `--repo-url <url>` or `--create-remote`).
    - Writes `skill-manager.json` (with `auto_push: true`), creates universal hubs (`~/.agents/skills`, `~/.config/agents/skills`), links every detected target, commits, and pushes if a remote is configured.
    - No `gh` CLI → `init` prints the two `git remote add` / `git push` lines; relay them.
-   - Dual WSL + Windows → repo on a Windows drive (`/mnt/d/skills_repo`) + `--include-windows`, then run `restore --apply` on the Windows side as well.
+   - Dual WSL + Windows → repo on a Windows drive (`/mnt/d/skills-repo`) + `--include-windows`, then run `restore --apply` on the Windows side as well.
 5. `... doctor` — report problems/warnings (secrets, unmanaged dirs, no remote).
 6. Have the user paste `assets/agents-md-snippet.md` into their global `AGENTS.md`/`CLAUDE.md`.
 
@@ -158,9 +161,9 @@ skillkit.py update [name...] --apply     # re-fetch, stage & swap safely, relink
 ### New machine / new WSL distro
 
 ```
-git clone <remote> ~/skills_repo
-skillkit.py restore --repo ~/skills_repo          # dry run
-skillkit.py restore --repo ~/skills_repo --apply  # rebuild all links & remember location
+git clone <remote> ~/skills-repo
+skillkit.py restore --repo ~/skills-repo          # dry run
+skillkit.py restore --repo ~/skills-repo --apply  # rebuild all links & remember location
 skillkit.py doctor
 ```
 A skill that exists as a real directory makes `restore` refuse — that is intended; use
@@ -199,7 +202,7 @@ Do not purge it as part of the task; purging is the user's decision (`trash --pu
 - `references/migration.md` — the Agent-executable migration contract
 - `references/troubleshooting.md` — Windows/junction/WSL/drvfs、仓库位置、同名冲突、密钥排查
 - `references/design.md` — why it works this way, data layout, known trade-offs
-- `assets/repo-readme-template.md` — README dropped into a fresh `skills_repo`
+- `assets/repo-readme-template.md` — README dropped into a fresh `skills-repo`
 - `assets/agents-md-snippet.md` — rules to paste into a global `AGENTS.md`
 - `assets/config.example.json` — `skill-manager.json` example
 

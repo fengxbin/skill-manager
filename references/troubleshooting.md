@@ -5,18 +5,18 @@
 `gh` 是 **GitHub 官方的命令行客户端**（GitHub CLI，<https://cli.github.com>）：
 
 - `gh auth login` → 登录（存 token）
-- `gh repo create <you>/skills-repo --private --source=. --push` → 一条命令建私有仓库并推送
-- `gh repo view <you>/skills-repo` / `gh api user --jq .login` → 查仓库、查用户名
+- `gh repo create <you>/skills_repo --private --source=.` → 一条命令建私有仓库
+- `gh repo view <you>/skills_repo` / `gh api user --jq .login` → 查仓库、查用户名
 
 **没装完全可以**：本工具只在 `gh` 存在**且** `gh auth status` 通过时才用它。
 否则 `init` 打印两行手动命令：
 
 ```bash
-git -C <repo> remote add origin git@github.com:<you>/skills-repo.git
+git -C <repo> remote add origin git@github.com:<you>/skills_repo.git
 git -C <repo> push -u origin HEAD
 ```
 
-也可以在网页上建好空仓库，然后 `init --repo-url <url>` 直接接入。
+也可以在网页上建好空仓库，然后 `init --repo-url <url> --apply` 直接接入并自动推送。
 
 ## "备份/回滚没有路径"指什么？
 
@@ -27,7 +27,7 @@ git -C <repo> push -u origin HEAD
 <repo>/.skill-manager/
 ├── backup/<YYYYmmdd-HHMMSS>/<env>/<name>/   # init 迁移前，原目录的完整副本
 ├── trash/<YYYYmmdd-HHMMSS>/<name>/          # 被判为重复而移走的副本、remove 掉的技能
-└── state.json                               # 这台机器建过哪些链（可重建，丢了也不致命）
+└── state-<platform>-<host>.json             # 当前环境的链接缓存（WSL 与 Windows 各自独立，丢了也可从文件系统推导）
 ```
 
 `init` / `remove` 都会把这次的路径打印出来。回滚 = 把目录**移动**回原来的 Agent 目录
@@ -86,23 +86,18 @@ python3 scripts/skillkit.py link --mode copy     --apply   # 最后手段，会�
 读：可以。写链接：可以，但必须 junction，且仓库要在 Windows 可见盘：
 
 ```bash
-python3 scripts/skillkit.py init --repo /mnt/d/skills-repo --include-windows --apply
+python3 scripts/skillkit.py init --repo /mnt/d/skills_repo --include-windows --apply
 ```
 
-**仓库在 `~/skills-repo`（ext4）会怎样？**
+**仓库在 `~/skills_repo`（ext4）会怎样？**
 
 Linux 侧正常；Windows 侧看不到，`init` 会提示，Windows 目标不会被链接。
 
-**跨用户会怎样？**
+**WSL 用户名和 Windows 用户名不同怎么办？**
 
-WSL 里 `--include-windows` 只认**与当前用户同名**的 Windows profile。若探测到的 profile 名与
-`$USER` 不同，直接拒绝并输出：
-
-```
-note: Windows profile 'xxx' is not the current user 'yyy'; cross-user operation refused
-```
-
-`--allow-cross-user` 可以强制，但这是例外，必须由用户明确要求。
+`--include-windows` 只通过 `cmd.exe /c echo %USERPROFILE%` 读取**当前活跃 Windows 会话**的用户目录，
+绝不枚举 `C:\Users\*` 下其他用户。若 WSL 以 `root` 运行则会直接拒绝（需显式 `--allow-cross-user`）；
+若普通 WSL 用户名与 Windows 目录名不同（例如微软账号目录名截断），会打印一条透明的 `note:` 提醒后正常处理。
 
 **drvfs 上的软链有延迟**
 
@@ -159,13 +154,13 @@ python3 scripts/skillkit.py trash --purge old-skill --confirm-delete   # 额外�
 ## 密钥泄露
 
 技能目录里可能混着 token（`.env`、`auth.json`、`.credentials.yaml`、`id_rsa`、`sk-...`）。
-`doctor` 会扫 7 类模式 + 敏感文件名并给出 warning；**推之前必须看一眼**。
+`doctor` 会扫 7 类模式 + 敏感文件名并给出 warning；**自动同步与 `push` 之前也会强制执行密钥检查，命中即拦截推送**（确认是误报时才显式传 `--allow-secrets`）。
 远端默认是**私有仓库**（`--create-remote` 强制 `--private`）。
 
 ## 仓库里出现嵌套 `.git`
 
-第三方 skill 用 `git clone` 拿到会带 `.git`。正确做法是走 `add <url>`：脚本 clone 到临时目录后
-**只复制 payload**，并把上游 URL 记到 `skill-manager.json.sources`，以后 `update` 刷新。
+第三方 skill 用 `git clone` 拿到会带 `.git`。正确做法是走 `add <url> --apply`：脚本 clone 到系统临时目录后
+**剥离 `.git` 只复制 payload**，同时把上游 URL 记到 `skill-manager.json.sources` 并自动推送到 GitHub，以后 `update --apply` 一键刷新。
 
 ## 权限 / 磁盘
 
@@ -177,19 +172,19 @@ python3 scripts/skillkit.py trash --purge old-skill --confirm-delete   # 额外�
 
 ```bash
 python3 scripts/skillkit.py repo                 # 当前路径 + 来源（flag / 环境变量 / 记录 / 默认）+ 推荐值
-python3 scripts/skillkit.py repo --set /mnt/d/skills-repo
+python3 scripts/skillkit.py repo --set /mnt/d/skills_repo
 python3 scripts/skillkit.py repo --forget
 ```
 
-`init --apply` 成功后会写入 `~/.config/skillkit/location`；之后 `list / doctor / push / pull` 都不用带路径。
+`init --apply` / `restore --apply` 成功后会写入 `~/.config/skillkit/location`；之后 `list / doctor / push / pull` 都不用带路径。
 
 ## 排查顺序（照这个顺序走）
 
 ```bash
-python3 scripts/skillkit.py repo         # 0. 用的哪个仓库、从哪来的
-python3 scripts/skillkit.py targets      # 1. 认得哪些目录，有没有被拒绝的
-python3 scripts/skillkit.py status       # 2. 是不是 git、有没有 remote、链几条
-python3 scripts/skillkit.py list         # 3. 每个 skill 链到了哪些 Agent
-python3 scripts/skillkit.py doctor       # 4. 缺链/断链/冲突/密钥/别家管理
-python3 scripts/skillkit.py doctor --fix # 5. 只修链接，不动 payload
+python3 scripts/skillkit.py repo                 # 0. 用的哪个仓库、从哪来的
+python3 scripts/skillkit.py targets              # 1. 认得哪些目录，有没有提示
+python3 scripts/skillkit.py status               # 2. 是不是 git、有没有 remote、auto_push 状态、链几条
+python3 scripts/skillkit.py list                 # 3. 每个 skill 链到了哪些 Agent
+python3 scripts/skillkit.py doctor               # 4. 缺链/断链/冲突/密钥/别家管理
+python3 scripts/skillkit.py doctor --fix --apply # 5. 只修链接和清死链，不动 payload
 ```

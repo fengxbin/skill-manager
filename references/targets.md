@@ -22,7 +22,7 @@
 | `claude` | Claude Code（含 GLM Coding Plan 走 Claude 的场景） | `.claude/skills` | 存在才绑定 | 官方文档 |
 | `codex` | OpenAI Codex CLI | `.codex/skills` | 存在才绑定 | 官方文档 |
 | `gemini` | Google Gemini CLI | `.gemini/skills` | 存在才绑定 | 官方文档 |
-| `antigravity` | Google Antigravity / Antigravity CLI | `.gemini/config/skills`<br>`.antigravity/skills` | 存在才绑定 | 官方文档 |
+| `antigravity` | Google Antigravity / Antigravity CLI | `.gemini/antigravity/skills`<br>`.gemini/config/skills`<br>`.antigravity/skills` | 存在才绑定 | 官方文档 |
 | `copilot` | GitHub Copilot CLI | `.copilot/skills` | 存在才绑定 | 官方文档 |
 | `cursor` | Cursor | `.cursor/skills` | 存在才绑定 | 官方文档 |
 | `windsurf` | Windsurf (Codeium) | `.codeium/windsurf/skills`<br>`.windsurf/skills` | 存在才绑定 | 官方文档 |
@@ -119,17 +119,19 @@
 | 环境 | HOME 根 | 说明 |
 |---|---|---|
 | `local` | `$HOME` | 当前系统（Linux / macOS / WSL 内） |
-| `windows` | `%USERPROFILE%`（WSL 下经 `cmd.exe` 探测） | **只处理与当前登录用户同名的那一个 profile** |
+| `windows` | `%USERPROFILE%`（WSL 下经 `cmd.exe` 探测） | **只处理当前活跃 Windows 会话的 `%USERPROFILE%`** |
 
-**跨用户保护**：Windows profile 名与当前用户不一致时直接拒绝，并在输出里给出 note；
-只有显式 `--allow-cross-user` 才会继续。任何解析出来的目标目录如果不在该环境 HOME 之下，
+**用户边界保护**：WSL 下只读当前 Windows 会话的 `%USERPROFILE%`（永不枚举 `C:\Users\*` 下其他用户目录）；
+若 WSL 当前用户为 `root` 则直接拒绝（`--allow-cross-user` 才例外）；若非 root 用户名与 Windows 目录名不同
+（微软账号常见截断），会输出提示 note 透明告知。任何解析出来的目标目录如果不在该环境 HOME 之下，
 也会被拒绝（`refusing target outside ...`）。
 
 **跨边界规则**
 
 - WSL 可以读 Windows 目录（`/mnt/c/...`），所以 `init --include-windows` 能收编 Windows 侧的技能。
-- Windows 读不到 WSL 的 ext4，所以仓库要放在 Windows 可见盘（`/mnt/d/skills-repo` ↔ `D:\skills-repo`）。
-- 每个环境的链接在各自环境内创建：WSL 建 symlink，Windows 建 junction。
+- Windows 读不到 WSL 的 ext4，所以仓库要放在 Windows 可见盘（`/mnt/d/skills_repo` ↔ `D:\skills_repo`）。
+- 每个环境的链接在各自环境内创建：WSL 建 symlink，Windows 建 junction；两端各自维护独立的状态文件
+  `state-<platform>-<host>.json`，互不覆盖。
 
 ## 查看本机情况
 

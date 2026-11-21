@@ -92,13 +92,13 @@
 |---|---|---|
 | 1 | `--repo PATH` | 显式指定，最高优先 |
 | 2 | `SKILLKIT_REPO` 环境变量 | CI、多仓库切换 |
-| 3 | `~/.config/skillkit/location` | `init` 成功后写入；`repo --set/--forget` 管理 |
-| 4 | 自动探测 | `~/skills-repo`、cwd 里的 `skill-manager.json` / `skills/` + `.git` |
+| 3 | `~/.config/skillkit/location` | `init` / `restore` 成功后写入；`repo --set/--forget` 管理 |
+| 4 | 自动探测 | `~/skills_repo`（并兼容旧名 `~/skills-repo`）、cwd 里的 `skill-manager.json` / `skills/` + `.git` |
 
 推荐值（`init` 会打印理由）：
 
-- WSL + 探测到 Windows profile → `/mnt/<第一个可用非 C: 盘>/skills-repo`（Windows 可见盘才两边都能用）
-- 其它 → `<home>/skills-repo`
+- WSL + 探测到 Windows profile → `/mnt/<第一个可用非 C: 盘>/skills_repo`（Windows 可见盘才两边都能用）
+- 其它 → `<home>/skills_repo`
 
 只在 `init`、只在交互终端、且优先值尚未记录时弹菜单；`--json` / `-y` / `CI` / 非 TTY 直接用推荐值并打印。
 路径安全校验：不得落在某 Agent 的 skills 目录内、不得是 `skills/` 目录本身、不得在 OneDrive/Dropbox/iCloud 里。
@@ -117,19 +117,23 @@
   "link_mode": "auto",
   "category_layout": true,
   "conflict_policy": "newest",
+  "auto_push": true,
   "sources": { "some-skill": "https://github.com/owner/repo" }
 }
 ```
 
-`.skill-manager/state.json`（不入库）：`links[]`（name/path/target/env/target_id/kind）、
-`backups[]`、`environments{}`。
+`.skill-manager/state-<platform>-<host>.json`（不入库，按平台和主机隔离，避免 WSL 与 Windows 互相覆盖）：
+`links[]`（name/path/target/env/target_id/kind）、`backups[]`、`environments{}`。
+同时 `list` / `status` / `doctor` / `remove` / `unlink` / `pull` 均直接以文件系统中的真实链接为真相源，
+即使状态文件丢失也能完整发现并维护所有链接。
 
 ## 幂等性
 
-- `init` 重跑：已是链接的跳过，已在仓库的副本让位（必要时备份），被别家管理的一直跳过。
-- `link` 重跑：指向正确就跳过，指向错误只替换链接点。
-- `doctor --fix` 只补缺失/断链，不动内容。
-- `add` 同名默认拒绝，`--force` 才替换（旧版进 trash）。
+- `init` 重跑：已是链接的跳过，已在仓库的副本让位（必要时备份），被别家管理的一直跳过（绝不参与冲突投票）。
+- `link` 重跑：指向正确就跳过，指向错误只替换本仓库的链接点，且按路径合并状态不覆盖其他目标。
+- `doctor --fix --apply` 只补缺失/过期链并清理已删技能的死链，修完后重新全量校验并如实报告结果。
+- `add` / `update` / `remove` 提交后在配置了远端且 `auto_push: true` 时自动推送到 GitHub（受推前密钥扫描保护，传 `--no-push` 可跳过）。
+- `add` 跨分类检查全局重名，默认拒绝，`--force` 才替换（旧版进 trash）。
 
 ## 验证证据（写这份实现时的实测）
 

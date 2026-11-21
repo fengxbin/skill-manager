@@ -4,6 +4,7 @@
   "link_mode": "auto",
   "category_layout": true,
   "conflict_policy": "newest",
+  "auto_push": true,
   "sources": {
     "example-skill": "https://github.com/owner/example-skill"
   }

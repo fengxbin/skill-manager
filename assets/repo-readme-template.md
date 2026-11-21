@@ -1,10 +1,10 @@
-# skills-repo
+# skills_repo
 
-我所有 Agent 技能的**唯一真相源**。
+我所有 AI 编程 Agent 技能的**唯一真相源**。
 
 真实文件只存在于本仓库的 `skills/` 下；每个 Agent 的技能目录里只有一个指向本仓库的**链接**
 （Linux/macOS/WSL: symlink，Windows: NTFS junction）。因此在仓库里改一次，所有 Agent 立刻生效
-（零复制、零漂移），Git 负责跨设备同步。
+（零复制、零漂移），并通过 GitHub 自动同步与跨设备恢复。
 
 已知 73 种 Agent 目录：Claude Code、OpenAI Codex、Pi、DeepSeek Harness、Google Gemini CLI、
 **Google Antigravity**、GitHub Copilot CLI、Cursor、Windsurf、Cline、Roo Code、Kilo Code、
@@ -16,29 +16,31 @@ Warp、Amp、Augment、Continue、AiderDesk、Tabnine、Zencoder、**Kimi Code C
 
 ## 目录结构
 
-```
-skills-repo/
+```text
+skills_repo/
 ├── README.md              # 本文件
-├── skill-manager.json     # 启用的 Agent 目标、链接模式、冲突策略、上游来源
+├── skill-manager.json     # 目标 Agent、链接模式、冲突策略、auto_push、上游来源
 ├── skills/
 │   └── <name>/SKILL.md    # 一个目录 = 一个技能（也允许 <category>/<name>/）
-└── .skill-manager/        # gitignored: state / backup / trash
+└── .skill-manager/        # gitignored: state-<platform>-<host>.json / backup / trash
 ```
 
-## 新增 / 修改一个技能
+## 新增 / 更新 / 修改一个技能
 
 ```bash
-# 新增（本地目录或 Git 仓库）
+# 新增（本地目录或 Git 仓库）：自动剥离 .git、全员建链、提交并自动 push 到 GitHub
 skillkit add <dir|git-url> --apply
-skillkit push --apply
 
-# 修改：直接改 skills/<name>/ 下的文件；链接会立刻反映到所有 Agent
-git add skills/<name> && git commit -m "update <name>" && git push
+# 更新上游记录过的技能：拉取最新、替换并备份旧版、自动 push 到 GitHub
+skillkit update --apply
+
+# 手工修改：直接改 skills/<name>/ 下的文件；链接会立刻反映到所有 Agent
+skillkit push -m "update <name>" --apply
 ```
 
 不要在这些地方直接编辑文件：`~/.agents/skills`、`~/.claude/skills`、`~/.pi/agent/skills`、
-`~/.codex/skills`、`~/.copilot/skills`、`~/.kimi/skills`、`~/.qwen/skills`、`~/.codebuddy/skills` —— 
-它们都是指向本仓库的链接。
+`~/.codex/skills`、`~/.gemini/antigravity/skills`、`~/.copilot/skills`、`~/.kimi/skills`、
+`~/.qwen/skills`、`~/.codebuddy/skills` —— 它们都是指向本仓库的链接。
 
 ## 链接关系
 
@@ -51,7 +53,7 @@ git add skills/<name> && git commit -m "update <name>" && git push
 | Pi agent | `~/.pi/agent/skills/<name>` |
 | DeepSeek Harness | `~/.dsh/skills/<name>` |
 | Google Gemini CLI | `~/.gemini/skills/<name>` |
-| Google Antigravity | `~/.gemini/config/skills/<name>` |
+| Google Antigravity | `~/.gemini/antigravity/skills/<name>`（或 `~/.gemini/config/skills/<name>`） |
 | GitHub Copilot CLI | `~/.copilot/skills/<name>` |
 | Cursor | `~/.cursor/skills/<name>` |
 | Windsurf | `~/.codeium/windsurf/skills/<name>` |
@@ -64,37 +66,37 @@ git add skills/<name> && git commit -m "update <name>" && git push
 ```bash
 # POSIX 手工等价写法（脚本会自动做，这里只是备查）
 mkdir -p ~/.claude/skills
-ln -s ~/skills-repo/skills/<name> ~/.claude/skills/<name>
+ln -s ~/skills_repo/skills/<name> ~/.claude/skills/<name>
 # Windows：junction，无需管理员权限
-cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills-repo\skills\<name>"
+cmd /c mklink /J "%USERPROFILE%\.codex\skills\<name>" "D:\skills_repo\skills\<name>"
 ```
 
 ## 规则
 
-- **同名冲突保留最新版本**：内容不同时以修改时间最新的为准，老版本备份到
-  `.skill-manager/backup/`，不删除。
+- **自动同步 GitHub + 推前密钥检查**：`add` / `update` / `remove` 默认自动 push（传 `--no-push` 可跳过），推送前扫描密钥，命中则拦截。
+- **同名冲突保留最新版本**：内容不同时以修改时间最新的为准，老版本备份到 `.skill-manager/backup/`，不删除。
 - **只操作当前用户**：不跨用户、不碰系统目录；项目级技能不动。
-- **被别的工具管理的目录跳过**：symlink / `skills-lock.json` / `install.json` / 内嵌 `.git`。
+- **被别的工具管理的目录跳过**：外部 symlink / `skills-lock.json` / `install.json` / 内嵌 `.git`。
 - **不做递归删除**：`remove` 只是移动进 `.skill-manager/trash/`。
 
 ## 迁移到新机器
 
 ```bash
-# 1. 克隆仓库（WSL + Windows 双环境：放在 Windows 可见盘，如 /mnt/d/skills-repo）
-git clone <repo-url> ~/skills-repo
+# 1. 克隆仓库（WSL + Windows 双环境：放在 Windows 可见盘，如 /mnt/d/skills_repo）
+git clone <repo-url> ~/skills_repo
 
 # 2. 重建全部链接（先 dry-run 看清单，再 --apply）
-skillkit restore --repo ~/skills-repo
-skillkit restore --repo ~/skills-repo --apply
+skillkit restore --repo ~/skills_repo
+skillkit restore --repo ~/skills_repo --apply
 
 # 3. 体检
-skillkit doctor --repo ~/skills-repo
+skillkit doctor --repo ~/skills_repo
 ```
 
 机器上已有"野生"技能目录时，用 `init` 而不是 `restore`（会先备份再迁移，冲突保留最新版本）：
 
 ```bash
-skillkit init --repo ~/skills-repo --apply
+skillkit init --repo ~/skills_repo --apply
 ```
 
 ## For Agents
@@ -103,18 +105,18 @@ skillkit init --repo ~/skills-repo --apply
 
 ```markdown
 1. 先跑只读命令：`skillkit.py targets` / `scan --json` / `list` / `doctor`，不要先动手。
-2. 任何写操作先 dry-run，把计划（导入哪些、备份哪些、冲突谁胜出、链到哪些目录）
+2. 任何写操作先 dry-run（含 `doctor --fix`），把计划（导入哪些、备份哪些、冲突谁胜出、链到哪些目录）
    念给用户，得到确认后才加 `--apply`。
-3. 安装新技能只能走 `skillkit.py add <dir|url>`，禁止手工 `cp` 到任何 Agent 目录，
+3. 安装新技能只能走 `skillkit.py add <dir|url> --apply`，禁止手工 `cp` 到任何 Agent 目录，
    禁止运行 Agent 自带的 skill 安装器写 `~/.codex/skills` 之类的位置。
-4. 同名冲突以"最新修改时间"为准；把每个变体的路径和时间如实报给用户。
-5. 只操作当前用户；项目级技能与"已被其它工具管理"的目录跳过并报告，不要接管。
-6. 永不 `rm -rf` / `del /s` / `Remove-Item -Recurse`。删除技能用
+4. `add` / `update` / `remove` 在配置了远端时会自动推送到 GitHub（受密钥扫描保护）；
+   若密钥扫描拦截了推送，必须先向用户汇报并清理密钥，不要擅自加 `--allow-secrets`。
+5. 同名冲突以"最新修改时间"为准；把每个变体的路径和时间如实报给用户。
+6. 只操作当前用户；项目级技能与"已被其它工具管理"的目录跳过并报告，不要接管。
+7. 永不 `rm -rf` / `del /s` / `Remove-Item -Recurse`。删除技能用
    `skillkit.py remove <name> --apply`（移入 `.skill-manager/trash/`）。
    确实需要清理垃圾时：先列出准确路径 → 用户确认 → `trash --purge <name> --confirm-delete`
    （还需手输 DELETE）。
-7. 迁移/同步过程中不要修改 `skills/` 里的内容；只做链接与同步操作。
-8. 结束时跑 `doctor` 并如实汇报 problems / warnings；有 secrets 告警时先停手问用户。
-9. 链接指向本仓库是正确状态；如果看到"真目录"而不是链接，说明还有未纳管的副本
-   （或它被别的工具管理）。
+8. 迁移/同步过程中不要修改 `skills/` 里的内容；只做链接与同步操作。
+9. 结束时跑 `doctor` 并如实汇报 problems / warnings。
 ```

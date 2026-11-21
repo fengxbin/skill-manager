@@ -2,11 +2,16 @@
 """skillkit — one-repo, symlink-first skill manager for multi-agent setups.
 
 Design contract (see ../references/design.md):
-  * The Git repo is the SINGLE SOURCE OF TRUTH. Real files live only there.
-  * Every agent's skill directory receives a *link* (symlink / NTFS junction),
-    never a copy, so editing the repo changes every agent at once (zero drift).
+  * One central Git repo (`skills_repo`) is the SINGLE SOURCE OF TRUTH. Real
+    skill files live only there.
+  * Every agent's skill directory receives a *link* (POSIX symlink / Windows
+    NTFS junction), never a copy, so editing the repo changes every agent at
+    once (zero copy, zero drift).
+  * Changes (add / update / remove / init) automatically sync to the GitHub
+    remote when configured (guarded by secret scanning; pass --no-push to skip).
   * Every mutating command is dry-run by default and only writes with --apply.
-  * Nothing is ever deleted recursively. Removals are moves into <repo>/.trash/.
+  * Nothing is ever deleted recursively. Removals are moves into
+    <repo>/.skill-manager/trash/.
 
 Python 3.8+, standard library only. Works on Linux, macOS, Windows and WSL.
 """
@@ -17,17 +22,21 @@ import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
-DEFAULT_REPO = "~/skills-repo"
+VERSION = "1.1.0"
+DEFAULT_REPO = "~/skills_repo"
+LEGACY_DEFAULT_REPO = "~/skills-repo"
 CONFIG_NAME = "skill-manager.json"
 STATE_DIR = ".skill-manager"
-TRASH_DIR = ".trash"
 SKILL_FILE = "SKILL.md"
+SELF_SKILL_ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------
 # Agent target table (the single place to add a new agent).
@@ -54,7 +63,8 @@ _TARGET_SPEC = [
     ("claude", "Claude Code（含 GLM Coding Plan 走 Claude 的场景）", [".claude/skills"], "auto", "海外", "doc"),
     ("codex", "OpenAI Codex CLI", [".codex/skills"], "auto", "海外", "doc"),
     ("gemini", "Google Gemini CLI", [".gemini/skills"], "auto", "海外", "doc"),
-    ("antigravity", "Google Antigravity / Antigravity CLI", [".gemini/config/skills", ".antigravity/skills"], "auto", "海外", "doc"),
+    ("antigravity", "Google Antigravity / Antigravity CLI",
+     [".gemini/antigravity/skills", ".gemini/config/skills", ".antigravity/skills"], "auto", "海外", "doc"),
     ("copilot", "GitHub Copilot CLI", [".copilot/skills"], "auto", "海外", "doc"),
     ("cursor", "Cursor", [".cursor/skills"], "auto", "海外", "doc"),
     ("windsurf", "Windsurf (Codeium)", [".codeium/windsurf/skills", ".windsurf/skills"], "auto", "海外", "doc"),
@@ -203,16 +213,43 @@ def windows_visible(p):
     return bool(re.match(r"^/mnt/[a-zA-Z]/", str(p)))
 
 
+def _strip_win_prefix(s):
+    if s.startswith("\\\\?\\UNC\\") or s.startswith("\\??\\UNC\\"):
+        return "\\\\" + s[8:]
+    if s.startswith("\\\\?\\") or s.startswith("\\??\\"):
+        return s[4:]
+    return s
+
+
+def _norm_path(p):
+    s = _strip_win_prefix(str(p))
+    return os.path.normcase(os.path.normpath(s))
+
+
+def same_path(a, b):
+    try:
+        return _norm_path(os.path.realpath(str(a))) == _norm_path(os.path.realpath(str(b)))
+    except OSError:
+        return _norm_path(a) == _norm_path(b)
+
+
+def path_within(child, parent):
+    c = _norm_path(child)
+    p = _norm_path(parent)
+    return c == p or c.startswith(p.rstrip(os.sep) + os.sep)
+
+
 def is_junction(p):
     p = Path(p)
-    if not p.is_dir() or p.is_symlink():
+    if p.is_symlink():
         return False
     if os.name == "nt":
         try:
-            import ctypes  # noqa: F401  (attribute probe below)
+            import ctypes
             FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+            FILE_ATTRIBUTE_DIRECTORY = 0x10
             attrs = ctypes.windll.kernel32.GetFileAttributesW(str(p))
-            return bool(attrs != -1 and attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+            return bool(attrs != -1 and (attrs & FILE_ATTRIBUTE_REPARSE_POINT) and (attrs & FILE_ATTRIBUTE_DIRECTORY))
         except Exception:
             return False
     # Under WSL a junction is surfaced as a symlink, so os.path.islink already
@@ -220,28 +257,60 @@ def is_junction(p):
     return False
 
 
+def is_skill_link(p):
+    p = Path(p)
+    return p.is_symlink() or is_junction(p)
+
+
+def resolve_link_target(p):
+    """Resolve the target of a symlink or junction (works even when dangling)."""
+    p = Path(p)
+    if not is_skill_link(p):
+        return None
+    try:
+        raw = os.readlink(str(p))
+        raw = _strip_win_prefix(raw)
+        tp = Path(raw)
+        if not tp.is_absolute():
+            tp = p.parent / tp
+        return Path(os.path.normpath(str(tp)))
+    except OSError:
+        pass
+    try:
+        return Path(os.path.normpath(_strip_win_prefix(os.path.realpath(str(p)))))
+    except OSError:
+        return None
+
+
 def link_points_to(link, target):
     """True when `link` is a live link resolving to `target` (symlink or junction)."""
     link, target = Path(link), Path(target)
-    if not link.exists() and not link.is_symlink():
+    if not is_skill_link(link) or not target.exists():
         return False
     try:
-        if link.is_symlink():
-            return Path(os.path.realpath(link)).resolve() == target.resolve()
-        return os.path.samefile(link, target) and Path(os.path.realpath(link)).resolve() == target.resolve()
+        resolved = resolve_link_target(link)
+        if resolved and same_path(resolved, target):
+            return True
+        if link.exists():
+            return os.path.samefile(str(link), str(target))
     except OSError:
         return False
+    return False
 
 
 def make_link(target, link, mode="auto", env="local"):
-    """Create a link. Returns the created kind ('symlink'|'junction'|'copy') or raises."""
+    """Create a link. Returns the created kind ('symlink'|'junction'|'copy') or raises.
+
+    In 'auto' mode, never silently falls back to copy (zero-drift invariant).
+    Pass --mode copy explicitly if you really want a copy.
+    """
     target, link = Path(target), Path(link)
     link.parent.mkdir(parents=True, exist_ok=True)
-    if link.exists() or link.is_symlink():
+    if link.exists() or is_skill_link(link):
         raise RuntimeError("path already exists: %s" % link)
 
     if mode == "copy":
-        shutil.copytree(str(target), str(link))
+        copy_tree(target, link, keep_git=False)
         return "copy"
 
     errors = []
@@ -254,17 +323,17 @@ def make_link(target, link, mode="auto", env="local"):
         if not win_target:
             raise RuntimeError(
                 "cannot link a Windows path to a non-Windows path (%s). "
-                "Keep the repo on a Windows-visible drive (e.g. D:\\skills-repo), "
+                "Keep the repo on a Windows-visible drive (e.g. D:\\skills_repo), "
                 "or run skillkit natively on Windows." % target
             )
         cwd = "/mnt/c" if (is_wsl() and Path("/mnt/c").is_dir()) else None
         rc, out, err = sh_in(["cmd.exe", "/c", "mklink", "/J", win_link, win_target], cwd=cwd)
-        if rc != 0 and (Path(link).exists() or Path(link).is_symlink()) and link_points_to(link, target):
+        if rc != 0 and is_skill_link(link) and link_points_to(link, target):
             rc = 0  # cmd reported failure but the junction is live (encoding/UNC noise)
         if rc == 0:
             # drvfs/9p visibility can lag by a moment; rc==0 means it was created
             for _ in range(15):
-                if Path(link).exists() or Path(link).is_symlink():
+                if link.exists() or is_skill_link(link):
                     break
                 time.sleep(0.1)
             return "junction"
@@ -279,13 +348,10 @@ def make_link(target, link, mode="auto", env="local"):
             if mode == "symlink":
                 raise RuntimeError(errors[-1])
 
-    if mode == "auto":
-        if Path(link).exists() or Path(link).is_symlink():
-            raise RuntimeError("path already exists after link attempt: %s" % link)
-        shutil.copytree(str(target), str(link))
-        print("  ! fell back to COPY for %s (zero-drift lost): %s" % (link, "; ".join(errors)))
-        return "copy"
-    raise RuntimeError("; ".join(errors) or "link creation failed")
+    raise RuntimeError(
+        "link creation failed (%s). Pass --mode copy only if you explicitly accept losing zero-drift."
+        % ("; ".join(errors) or "unknown error")
+    )
 
 
 def remove_link(link, kind=None):
@@ -294,25 +360,70 @@ def remove_link(link, kind=None):
     if link.is_symlink():
         os.unlink(str(link))
         return True
-    if not link.exists():
+    if not link.exists() and not is_junction(link):
         return True
     if os.name == "nt":
+        if not is_junction(link):
+            return False  # refuse to touch a real directory
         try:
             os.rmdir(str(link))  # removes a junction, leaves its target intact
             return True
         except OSError:
-            return False
+            rc, _, _ = sh(["cmd.exe", "/c", "rmdir", str(link)])
+            return rc == 0
     if is_wsl() and windows_visible(link):
         rc, _, _ = sh(["cmd.exe", "/c", "rmdir", to_win_path(link)])
         if rc == 0:
             return True
+    return False
+
+
+def _unlink_file(path):
+    """Remove a single file or symlink, clearing Windows read-only bit if needed."""
+    s = str(path)
     try:
-        os.rmdir(str(link))
-        return True
+        os.unlink(s)
+    except PermissionError:
+        try:
+            os.chmod(s, stat.S_IWRITE)
+            os.unlink(s)
+        except OSError:
+            raise
+
+
+def _cleanup_temp_dir(tmp):
+    """Remove a tool-created temp clone directory (strictly inside system tempdir)."""
+    if not tmp:
+        return
+    tmp = Path(tmp)
+    if not tmp.exists() and not is_skill_link(tmp):
+        return
+    sys_tmp = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved = tmp.resolve()
+    except OSError:
+        return
+    if not path_within(resolved, sys_tmp) or not resolved.name.startswith("skillkit-"):
+        return
+    for cur, dirs, files in os.walk(str(resolved), topdown=False):
+        for name in files:
+            try:
+                _unlink_file(os.path.join(cur, name))
+            except OSError:
+                pass
+        for d in dirs:
+            dp = os.path.join(cur, d)
+            try:
+                if os.path.islink(dp):
+                    os.unlink(dp)
+                else:
+                    os.rmdir(dp)
+            except OSError:
+                pass
+    try:
+        os.rmdir(str(resolved))
     except OSError:
         pass
-    # last resort: refuse to touch a real directory
-    return False
 
 
 def read_frontmatter(path):
@@ -357,6 +468,8 @@ def newest_mtime(path):
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d.lower() not in IGNORE_DIR_NAMES]
         for name in files:
+            if name in IGNORE_FILE_NAMES:
+                continue
             try:
                 newest = max(newest, (Path(root) / name).stat().st_mtime)
             except OSError:
@@ -371,20 +484,88 @@ def human_time(ts):
         return "?"
 
 
-def copy_tree(src, dst):
+def copy_tree(src, dst, keep_git=False):
+    """Copy a skill directory, excluding build/cache noise (and .git by default)."""
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(str(src), str(dst), ignore=shutil.ignore_patterns(*IGNORE_DIR_NAMES - {".git"}))
+    ignored_dirs = IGNORE_DIR_NAMES if not keep_git else (IGNORE_DIR_NAMES - {".git"})
+
+    def _ignore(cur, names):
+        out = []
+        for n in names:
+            if n in IGNORE_FILE_NAMES or n.lower() in ignored_dirs:
+                out.append(n)
+        return out
+
+    shutil.copytree(str(src), str(dst), ignore=_ignore)
     return dst
+
+
+def _unique_path(parent, label):
+    """Avoid backup/trash collisions when a tool has multiple candidate dirs."""
+    parent = Path(parent)
+    cand = parent / label
+    if not cand.exists() and not is_skill_link(cand):
+        return cand
+    i = 2
+    while True:
+        cand = parent / ("%s_%d" % (label, i))
+        if not cand.exists() and not is_skill_link(cand):
+            return cand
+        i += 1
 
 
 def is_skill_dir(p):
     return (Path(p) / SKILL_FILE).is_file()
 
 
-def is_skill_link(p):
-    p = Path(p)
-    return p.is_symlink() or is_junction(p)
+def _repo_name_from_url(url):
+    cleaned = url.strip().rstrip("/")
+    cleaned = re.sub(r"[?#].*$", "", cleaned)
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    part = re.split(r"[/:]", cleaned)[-1]
+    return part or "skill"
+
+
+def _discover_skills_in_tree(root):
+    """Find every skill directory inside a cloned git repository."""
+    root = Path(root)
+    if is_skill_dir(root):
+        return [root]
+    found = []
+    for cur, dirs, files in os.walk(str(root)):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in IGNORE_DIR_NAMES)
+        curp = Path(cur)
+        if SKILL_FILE in files:
+            found.append(curp)
+            dirs[:] = []  # do not descend into a skill
+    return found
+
+
+def scan_secrets(repo):
+    """Scan all repo skills for likely secrets / credential files."""
+    findings = []
+    for sk in repo_skills(repo):
+        for cur, dirs, files in os.walk(str(sk["path"])):
+            dirs[:] = [d for d in dirs if d.lower() not in IGNORE_DIR_NAMES]
+            for name in files:
+                fp = Path(cur) / name
+                rel = str(fp.relative_to(repo)).replace(os.sep, "/")
+                if any(h in name.lower() for h in SECRET_FILE_HINTS):
+                    findings.append({"file": str(fp), "rel": rel, "reason": "possible secret file"})
+                    continue
+                try:
+                    if fp.stat().st_size > 512 * 1024:
+                        continue
+                    text = fp.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                for rx, label in SECRET_PATTERNS:
+                    if rx.search(text):
+                        findings.append({"file": str(fp), "rel": rel, "reason": label})
+                        break
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +588,23 @@ class Context(object):
         self.config = self._load_config()
         self.state = self._load_state()
 
+    def log(self, msg=""):
+        if not self.json:
+            log(msg)
+
+    def platform_tag(self):
+        if self.wsl:
+            return "wsl"
+        if os.name == "nt":
+            return "windows"
+        if sys.platform == "darwin":
+            return "darwin"
+        return "linux"
+
+    def env_id(self):
+        host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname() or "local")
+        return "%s-%s" % (self.platform_tag(), host)
+
     # -- repo -------------------------------------------------------------
     def location_file(self):
         """Pointer file that remembers where the repo lives on THIS machine.
@@ -416,6 +614,17 @@ class Context(object):
         so it is never committed to the repo.
         """
         return self.home / ".config" / "skillkit" / "location"
+
+    def _looks_like_repo(self, cand):
+        if not cand.is_dir():
+            return False
+        if (cand / CONFIG_NAME).is_file():
+            return True
+        if (cand / STATE_DIR).is_dir() and any((cand / STATE_DIR).glob("state*.json")):
+            return True
+        if (cand / "skills").is_dir() and (cand / ".git").exists():
+            return True
+        return False
 
     def _resolve_repo(self):
         self.repo_source = "none"
@@ -436,17 +645,25 @@ class Context(object):
                 recorded = ""
             if recorded:
                 cand = Path(recorded).expanduser().resolve()
-                if cand.is_dir() and ((cand / CONFIG_NAME).is_file() or (cand / (STATE_DIR + "/state.json")).is_file()
-                                      or (cand / "skills").is_dir()):
+                if cand.is_dir() and (self._looks_like_repo(cand) or (cand / "skills").is_dir()):
                     self.repo_source = "recorded location (%s)" % loc
                     return cand
 
-        for cand in [self.home / "skills-repo", Path(DEFAULT_REPO).expanduser(), Path.cwd()]:
+        candidates = [
+            self.home / "skills_repo",
+            Path(DEFAULT_REPO).expanduser(),
+            self.home / "skills-repo",
+            Path(LEGACY_DEFAULT_REPO).expanduser(),
+            Path.cwd(),
+        ]
+        seen = set()
+        for cand in candidates:
             cand = cand.resolve()
-            if (cand / CONFIG_NAME).is_file() or (cand / (STATE_DIR + "/state.json")).is_file():
-                self.repo_source = "auto-detected (%s)" % cand
-                return cand
-            if (cand / "skills").is_dir() and (cand / ".git").exists():
+            key = _norm_path(cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._looks_like_repo(cand):
                 self.repo_source = "auto-detected (%s)" % cand
                 return cand
         return None
@@ -459,12 +676,12 @@ class Context(object):
             loc.write_text(str(Path(repo).resolve()) + "\n", encoding="utf-8")
             return True
         except OSError as exc:
-            print("  ! could not record repo location (%s): %s" % (loc, exc))
+            self.log("  ! could not record repo location (%s): %s" % (loc, exc))
             return False
 
     def require_repo(self):
         if not self.repo:
-            die("no skills repo found. Pass --repo PATH, set SKILLKIT_REPO, run 'skillkit init' "
+            die("no skills_repo found. Pass --repo PATH, set SKILLKIT_REPO, run 'skillkit init' "
                 "(it remembers the location), or see 'skillkit repo --help'.")
         return self.repo
 
@@ -475,6 +692,8 @@ class Context(object):
             "targets": None,
             "link_mode": "auto",
             "category_layout": True,
+            "conflict_policy": "newest",
+            "auto_push": True,
             "sources": {},
         }
         if self.repo:
@@ -492,14 +711,26 @@ class Context(object):
         p.write_text(json.dumps(self.config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def _state_path(self):
-        return self.repo / STATE_DIR / "state.json" if self.repo else None
+        if not self.repo:
+            return None
+        return self.repo / STATE_DIR / ("state-%s.json" % self.env_id())
 
     def _load_state(self):
-        st = {"version": 1, "links": [], "backups": [], "environments": {}}
+        st = {"version": 1, "env_id": self.env_id(), "links": [], "backups": [], "environments": {}}
         p = self._state_path()
-        if p and p.is_file():
+        legacy = (self.repo / STATE_DIR / "state.json") if self.repo else None
+        src = p if (p and p.is_file()) else (legacy if (legacy and legacy.is_file()) else None)
+        if src:
             try:
-                st.update(json.loads(p.read_text(encoding="utf-8")))
+                loaded = json.loads(src.read_text(encoding="utf-8"))
+                st.update(loaded)
+                # Filter out foreign-OS paths when migrating from a shared legacy state.json
+                if src == legacy:
+                    is_nt = (os.name == "nt")
+                    st["links"] = [
+                        l for l in st.get("links", [])
+                        if (bool(re.match(r"^[A-Za-z]:[\\/]", l.get("path", ""))) == is_nt)
+                    ]
             except ValueError:
                 pass
         return st
@@ -507,16 +738,13 @@ class Context(object):
     def save_state(self):
         p = self._state_path()
         p.parent.mkdir(parents=True, exist_ok=True)
+        self.state["env_id"] = self.env_id()
         p.write_text(json.dumps(self.state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         self.ensure_scaffolding()
 
     # -- environments -----------------------------------------------------
     def windows_home(self):
-        """The CURRENT Windows user's profile as seen from WSL.
-
-        Only the same user is considered: cross-user operation is refused unless
-        --allow-cross-user is passed explicitly (see windows_home_guard()).
-        """
+        """The CURRENT Windows user's profile as seen from WSL (via %USERPROFILE%)."""
         if not self.wsl or os.environ.get("SKILLKIT_HOME"):
             return None
         if not Path("/mnt/c/Users").is_dir():
@@ -534,16 +762,27 @@ class Context(object):
         return os.environ.get("USER") or os.environ.get("USERNAME") or ""
 
     def windows_home_guard(self):
-        """Return (profile, reason) — profile is None when it must not be touched."""
+        """Return (profile, reason).
+
+        Uses only %USERPROFILE% of the active Windows session (never enumerates
+        other C:\\Users\\* directories). Refuses root unless --allow-cross-user;
+        for non-root username differences (common with MS accounts), allows the
+        active %USERPROFILE% and attaches a transparent note.
+        """
         wh = self.windows_home()
         if not wh:
             return None, "no Windows profile detected"
-        if getattr(self.args, "allow_cross_user", False):
-            return wh, ""
         me, them = self.current_user(), wh.name
+        if me.lower() == "root" and not getattr(self.args, "allow_cross_user", False):
+            return None, (
+                "running as root; touching Windows profile '%s' is refused "
+                "(pass --allow-cross-user to override)" % them
+            )
         if me and them and me.lower() != them.lower():
-            return None, ("Windows profile '%s' is not the current user '%s'; "
-                          "cross-user operation refused (pass --allow-cross-user to override)" % (them, me))
+            return wh, (
+                "using active Windows session profile '%s' (differs from Linux user '%s'; "
+                "only %%USERPROFILE%% is touched)" % (them, me)
+            )
         return wh, ""
 
     def env_homes(self, include_windows=False):
@@ -552,7 +791,7 @@ class Context(object):
             wh, reason = self.windows_home_guard()
             if wh:
                 homes["windows"] = wh
-            elif reason:
+            if reason and reason not in self.environment_notes:
                 self.environment_notes.append(reason)
         return homes
 
@@ -563,8 +802,8 @@ class Context(object):
     def target_roots(self, target, env, home, create=False):
         """Existing candidate directories for a target (all of them).
 
-        With create=True, a "always" bind target gets its primary directory
-        created when none of the candidates exists yet.
+        With create=True, an "always" bind target returns its primary directory
+        so it can be created during --apply (dry-run never creates dirs).
         """
         roots = [r for r in self.candidate_roots(target, home) if r.is_dir()]
         if roots:
@@ -575,15 +814,9 @@ class Context(object):
 
     def _within(self, path, home):
         try:
-            return Path(path).resolve().is_relative_to(Path(home).resolve())
-        except AttributeError:  # py3.8
-            try:
-                Path(path).resolve().relative_to(Path(home).resolve())
-                return True
-            except ValueError:
-                return False
-        except ValueError:
-            return False
+            return path_within(Path(path).resolve(), Path(home).resolve())
+        except OSError:
+            return path_within(path, home)
 
     def enabled_targets(self, create=False):
         """Resolve which agent directories this machine manages."""
@@ -596,8 +829,9 @@ class Context(object):
                     continue
                 for root in self.target_roots(t, env, home, create=create):
                     if not self._within(root, home):
-                        self.environment_notes.append(
-                            "refusing target outside %s: %s (only the current user's home is managed)" % (home, root))
+                        note = "refusing target outside %s: %s (only the current user's home is managed)" % (home, root)
+                        if note not in self.environment_notes:
+                            self.environment_notes.append(note)
                         continue
                     resolved.append({"target": t, "env": env, "root": root})
         return resolved
@@ -610,7 +844,9 @@ class Context(object):
             if not t:
                 die("unknown target id: %s" % tid)
             for env, home in homes.items():
-                roots = self.target_roots(t, env, home, create=True)
+                roots = [r for r in self.candidate_roots(t, home) if r.is_dir()]
+                if not roots:
+                    roots = [self.candidate_roots(t, home)[0]]
                 for root in roots:
                     if self._within(root, home):
                         out.append({"target": t, "env": env, "root": root})
@@ -634,7 +870,7 @@ class Context(object):
     # -- output -----------------------------------------------------------
     def emit(self, obj, text=None):
         if self.json:
-            print(json.dumps(obj, indent=2, ensure_ascii=False))
+            print(json.dumps(obj, indent=2, ensure_ascii=False), flush=True)
         elif text is not None:
             log(text)
         else:
@@ -642,7 +878,7 @@ class Context(object):
 
 
 # ---------------------------------------------------------------------------
-# Repo skill discovery
+# Repo skill discovery & live link discovery
 # ---------------------------------------------------------------------------
 
 
@@ -653,7 +889,7 @@ def repo_skills(repo):
     out = []
     if not root.is_dir():
         return out
-    for cur, dirs, files in os.walk(root):
+    for cur, dirs, files in os.walk(str(root)):
         dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in {"node_modules"})
         curp = Path(cur)
         if len(curp.relative_to(root).parts) > 3:
@@ -678,23 +914,39 @@ FOREIGN_MARKERS = (".skills-lock.json", "skills-lock.json", ".skill-manager.json
 
 
 def is_our_link(entry, repo):
-    """True when the link resolves into our repo (that is the desired state)."""
+    """True when `entry` is a symlink/junction pointing inside our repo (live or dangling)."""
     if not repo:
         return False
     entry = Path(entry)
-    if not (entry.is_symlink() or is_junction(entry)):
+    if not is_skill_link(entry):
         return False
-    real = Path(os.path.realpath(entry))
-    repo = Path(repo)
-    return real == repo or repo in real.parents
+    target = resolve_link_target(entry)
+    if not target:
+        return False
+    repo_real = os.path.realpath(str(repo))
+    target_real = os.path.realpath(str(target)) if target.exists() else str(target)
+    return path_within(target_real, repo_real) or path_within(str(target), str(repo))
+
+
+def is_self_skill(entry):
+    """True when `entry` is a link pointing to skill-manager itself."""
+    entry = Path(entry)
+    if not is_skill_link(entry):
+        return False
+    target = resolve_link_target(entry)
+    if not target:
+        return False
+    return same_path(target, SELF_SKILL_ROOT)
 
 
 def foreign_reason(entry, repo=None):
     """Why an existing skill directory must be left alone (None = adoptable)."""
     entry = Path(entry)
-    if entry.is_symlink() or is_junction(entry):
+    if is_skill_link(entry):
         if is_our_link(entry, repo):
             return None
+        if is_self_skill(entry):
+            return "self (skill-manager)"
         return "symlink (already linked/managed by another tool)"
     for marker in FOREIGN_MARKERS:
         if (entry / marker).is_file():
@@ -702,6 +954,79 @@ def foreign_reason(entry, repo=None):
     if (entry / ".git").exists():
         return "git checkout inside the skill dir (use 'add <url>' instead)"
     return None
+
+
+def discover_our_links(ctx, repo, targets=None):
+    """Derive active + dangling links pointing into `repo` directly from the filesystem,
+    plus any extra paths tracked in this environment's state file.
+    """
+    if targets is None:
+        targets = ctx.enabled_targets(create=False)
+    by_path = {}
+    for tr in targets:
+        root = tr["root"]
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if is_skill_link(entry) and is_our_link(entry, repo):
+                resolved = resolve_link_target(entry)
+                kind = "junction" if is_junction(entry) else "symlink"
+                by_path[_norm_path(entry)] = {
+                    "name": entry.name,
+                    "path": str(entry),
+                    "target": str(resolved) if resolved else "",
+                    "env": tr["env"],
+                    "target_id": tr["target"]["id"],
+                    "kind": kind,
+                    "exists": entry.exists(),
+                }
+    for entry in ctx.state.get("links", []):
+        lp = Path(entry["path"])
+        key = _norm_path(lp)
+        if key in by_path:
+            continue
+        if is_skill_link(lp) and is_our_link(lp, repo):
+            resolved = resolve_link_target(lp)
+            by_path[key] = {
+                "name": entry["name"],
+                "path": str(lp),
+                "target": str(resolved) if resolved else entry.get("target", ""),
+                "env": entry.get("env", "local"),
+                "target_id": entry.get("target_id", "?"),
+                "kind": "junction" if is_junction(lp) else "symlink",
+                "exists": lp.exists(),
+            }
+    return list(by_path.values())
+
+
+def prune_dangling_links(ctx, repo, targets=None, apply=False):
+    """Remove links pointing into <repo>/skills/ whose target skill no longer exists."""
+    skills_root = Path(repo) / "skills"
+    skills_real = os.path.realpath(str(skills_root))
+    pruned = []
+    for entry in discover_our_links(ctx, repo, targets=targets):
+        tp = Path(entry["target"]) if entry["target"] else None
+        if not tp:
+            continue
+        in_skills = path_within(str(tp), skills_real) or path_within(str(tp), str(skills_root))
+        if in_skills and not tp.exists():
+            pruned.append(entry)
+            if apply:
+                lp = Path(entry["path"])
+                if remove_link(lp):
+                    ctx.state["links"] = [
+                        e for e in ctx.state.get("links", [])
+                        if _norm_path(e["path"]) != _norm_path(lp)
+                    ]
+    if apply and pruned:
+        ctx.save_state()
+    return pruned
 
 
 def scan_env(ctx, env, home):
@@ -719,18 +1044,21 @@ def scan_env(ctx, env, home):
                 if entry.name.startswith("."):
                     continue
                 reason = foreign_reason(entry, ctx.repo)
-                if entry.is_symlink() or is_junction(entry):
+                if is_skill_link(entry):
+                    resolved = resolve_link_target(entry)
                     found.append({
                         "name": entry.name, "path": entry, "env": env, "target_id": t["id"],
-                        "kind": "symlink", "points_to": os.path.realpath(entry), "hash": None,
-                        "mtime": 0, "files": 0, "frontmatter": {}, "managed_by": reason,
-                        "own": is_our_link(entry, ctx.repo), "has_git": False,
+                        "kind": "junction" if is_junction(entry) else "symlink",
+                        "points_to": str(resolved) if resolved else "",
+                        "hash": None, "mtime": 0, "files": 0, "frontmatter": {},
+                        "managed_by": reason, "own": is_our_link(entry, ctx.repo),
+                        "is_self": is_self_skill(entry), "has_git": False,
                     })
                     continue
                 if not entry.is_dir() or not is_skill_dir(entry):
                     continue
                 meta, _ = read_frontmatter(entry / SKILL_FILE)
-                nfiles = sum(len(f) for _, _, f in os.walk(entry))
+                nfiles = sum(len(f) for _, _, f in os.walk(str(entry)))
                 found.append({
                     "name": entry.name,
                     "fm_name": (meta.get("name") or "").strip(),
@@ -744,6 +1072,8 @@ def scan_env(ctx, env, home):
                     "files": nfiles,
                     "frontmatter": meta,
                     "managed_by": reason,
+                    "own": False,
+                    "is_self": False,
                     "has_git": (entry / ".git").exists(),
                 })
     return found
@@ -757,7 +1087,7 @@ def group_by_name(items):
 
 
 def pick_canonical(copies, prefer="newest"):
-    """Choose which copy becomes the repo truth.
+    """Choose which adoptable copy becomes the repo truth.
 
     prefer="newest"   -> newest mtime wins (default: the freshest install is
                          almost always the updated version), majority tie-break.
@@ -766,7 +1096,7 @@ def pick_canonical(copies, prefer="newest"):
     """
     variants = {}
     for c in copies:
-        if c.get("kind") == "symlink":
+        if c.get("kind") in ("symlink", "junction") or c.get("managed_by"):
             continue
         variants.setdefault(c["hash"], []).append(c)
     if not variants:
@@ -780,11 +1110,13 @@ def pick_canonical(copies, prefer="newest"):
     else:  # newest
         key = lambda kv: (mtime_of(kv[1]), len(kv[1]), sum(x["files"] for x in kv[1]))
     ranked = sorted(variants.items(), key=key, reverse=True)
-    return ranked[0][1][0], variants
+    # Within the winning content hash group, pick the copy with newest mtime
+    winners = sorted(ranked[0][1], key=lambda x: x["mtime"], reverse=True)
+    return winners[0], variants
 
 
 # ---------------------------------------------------------------------------
-# Git helpers
+# Git & GitHub sync helpers
 # ---------------------------------------------------------------------------
 
 
@@ -809,22 +1141,30 @@ def git_has_remote(repo):
     return rc == 0 and bool(out.strip())
 
 
+def git_has_upstream(repo):
+    rc, _, _ = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    return rc == 0
+
+
+def git_identity(repo, field):
+    rc, out, _ = git(repo, "config", "user." + field)
+    if rc == 0 and out:
+        return out
+    rc, out, _ = sh(["git", "config", "--global", "user." + field])
+    return out if rc == 0 else ""
+
+
 def git_commit(repo, message):
     if not git_dirty(repo):
         return False
     git(repo, "add", "-A", check=True)
     rc, _, err = git(repo, "-c", "user.name=" + (git_identity(repo, "name") or "skillkit"),
-                      "-c", "user.email=" + (git_identity(repo, "email") or "skillkit@localhost"),
-                      "commit", "-m", message)
+                     "-c", "user.email=" + (git_identity(repo, "email") or "skillkit@localhost"),
+                     "commit", "-m", message)
     if rc != 0:
-        print("  ! git commit failed: %s" % err)
+        print("  ! git commit failed: %s" % err, file=sys.stderr, flush=True)
         return False
     return True
-
-
-def git_identity(repo, field):
-    rc, out, _ = sh(["git", "config", "--global", "user." + field])
-    return out if rc == 0 else ""
 
 
 def have_gh():
@@ -833,6 +1173,43 @@ def have_gh():
         return False
     rc, _, _ = sh(["gh", "auth", "status"])
     return rc == 0
+
+
+def sync_push(ctx, repo, allow_secrets=False):
+    """Push repo to remote after secret check. Never destroys local commits."""
+    if not git_is_repo(repo):
+        return {"status": "skipped", "reason": "not a git repository"}
+    if not git_has_remote(repo):
+        return {"status": "skipped", "reason": "no git remote configured"}
+    findings = scan_secrets(repo)
+    if findings and not allow_secrets:
+        return {
+            "status": "blocked",
+            "reason": "potential secrets detected — push blocked (review or pass --allow-secrets)",
+            "findings": findings,
+        }
+    if git_has_upstream(repo):
+        rc, out, err = git(repo, "push")
+    else:
+        rc, out, err = git(repo, "push", "-u", "origin", "HEAD")
+    if rc == 0:
+        return {"status": "ok", "detail": out or "pushed to origin"}
+    return {"status": "failed", "detail": err or out}
+
+
+def _log_sync_result(ctx, res):
+    status = res.get("status")
+    if status == "ok":
+        ctx.log("sync   : pushed to GitHub remote")
+    elif status == "skipped":
+        ctx.log("sync   : skipped (%s)" % res.get("reason", ""))
+    elif status == "blocked":
+        ctx.log("sync   : BLOCKED — %s" % res.get("reason", ""))
+        for f in res.get("findings", [])[:10]:
+            ctx.log("         ! %s: %s" % (f["reason"], f["rel"]))
+    else:
+        ctx.log("sync   : push FAILED (%s) — local commit is safe; run 'skillkit push --apply' later"
+                % res.get("detail", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +1228,7 @@ def cmd_targets(ctx):
             n = 0
             for root in existing:
                 try:
-                    n += sum(1 for e in root.iterdir() if e.is_dir() or e.is_symlink())
+                    n += sum(1 for e in root.iterdir() if e.is_dir() or is_skill_link(e))
                 except OSError:
                     pass
             rows.append({
@@ -869,7 +1246,7 @@ def cmd_targets(ctx):
             r["env"], r["id"], "yes", "doc" if r["src"] == "doc" else "?", r["entries"], r["path"]))
     hub = [r for r in rows if not r["exists"] and r["bind"] == "always"]
     for r in hub:
-        lines.append("%-8s %-13s %-5s %-4s %-5d %s (created on demand)" % (
+        lines.append("%-8s %-13s %-5s %-4s %-5d %s (created on apply)" % (
             r["env"], r["id"], "no", "doc", 0, r["path"]))
     lines.append("")
     lines.append("%d detected dir(s) across %d environment(s); %d agent type(s) known." % (
@@ -877,7 +1254,7 @@ def cmd_targets(ctx):
     for note in ctx.environment_notes:
         lines.append("note: " + note)
     ctx.emit({"environments": {k: str(v) for k, v in homes.items()},
-              "detected": found, "known_targets": len(TARGETS),
+              "detected": found, "hubs": hub, "known_targets": len(TARGETS),
               "notes": ctx.environment_notes}, "\n".join(lines))
 
 
@@ -899,12 +1276,13 @@ def cmd_scan(ctx):
     groups = group_by_name(all_found)
     entries = []
     for name, copies in sorted(groups.items()):
-        real = [c for c in copies if c.get("kind") != "symlink" and not c.get("managed_by_probe")]
+        real = [c for c in copies if c.get("kind") == "dir" and not c.get("managed_by")]
         hashes = {c["hash"] for c in real if c.get("hash")}
-        canon, variants = pick_canonical(copies)
+        canon, _ = pick_canonical(real)
         entries.append({
             "name": name,
             "copies": len(copies),
+            "adoptable": len(real),
             "variants": len(hashes),
             "conflict": len(hashes) > 1,
             "managed_by": sorted({c["managed_by"] for c in copies if c.get("managed_by")}),
@@ -925,7 +1303,10 @@ def cmd_scan(ctx):
         locs = ", ".join("%s/%s" % (l["env"][:3], l["target"]) for l in e["locations"])
         flag = "  << CONFLICT" if e["conflict"] else ""
         if e["managed_by"]:
-            flag += "  [skip: managed by another tool]"
+            if e["managed_by"] == ["self (skill-manager)"]:
+                flag += "  [self]"
+            else:
+                flag += "  [skip: managed by another tool]"
         log("%-28s %-6d %-5d %-8s %s%s" % (e["name"][:28], e["copies"], e["variants"],
                                             (e["canonical"]["env"][:3] if e["canonical"] else "-"), locs, flag))
     for note in ctx.environment_notes:
@@ -939,19 +1320,21 @@ def cmd_scan(ctx):
 def _recommended_repo(ctx):
     """Best default for THIS machine, with the reason shown to the user."""
     if os.environ.get("SKILLKIT_HOME"):
-        return ctx.home / "skills-repo", "sandbox mode (SKILLKIT_HOME is set)"
+        return ctx.home / "skills_repo", "sandbox mode (SKILLKIT_HOME is set)"
     if ctx.wsl:
         for drive in ("d", "e", "f", "g"):
             root = Path("/mnt/%s" % drive)
             if root.is_dir():
-                return root / "skills-repo", "Windows-visible drive: WSL agents AND Windows agents can use it"
+                return root / "skills_repo", "Windows-visible drive: WSL agents AND Windows agents can use it"
         wh, _ = ctx.windows_home_guard()
         if wh:
-            return wh / "skills-repo", "current Windows profile (the WSL filesystem is invisible to Windows)"
-    return ctx.home / "skills-repo", "current user's home"
+            return wh / "skills_repo", "current Windows profile (the WSL filesystem is invisible to Windows)"
+    return ctx.home / "skills_repo", "current user's home"
 
 
-def _interactive():
+def _interactive(ctx=None):
+    if ctx and (ctx.json or ctx.yes):
+        return False
     if os.environ.get("CI") or os.environ.get("SKILLKIT_NONINTERACTIVE"):
         return False
     try:
@@ -963,7 +1346,7 @@ def _interactive():
 def _validate_repo_path(ctx, path):
     path = Path(path).expanduser().resolve()
     for tr in ctx.enabled_targets():
-        if path == tr["root"] or tr["root"] in path.parents:
+        if path_within(path, tr["root"]):
             return "inside an agent skill directory (%s)" % tr["root"]
     if path.name == "skills":
         return "that is a skills/ directory, not a repo root"
@@ -975,8 +1358,7 @@ def _validate_repo_path(ctx, path):
 def choose_repo(ctx, args):
     """Pick the repo location: --repo > recorded location > recommended default.
 
-    Asking the user is deliberately ONE-TIME (at init) and only when the answer
-    actually changes behaviour, e.g. a WSL box also serving Windows agents.
+    Asking the user is deliberately ONE-TIME (at init) and only when interactive.
     Everything else stays non-interactive so scripts and agents never block.
     """
     if args.repo:
@@ -986,17 +1368,17 @@ def choose_repo(ctx, args):
 
     rec, why = _recommended_repo(ctx)
     notes = []
-    alt = (ctx.home / "skills-repo").resolve()
+    alt = (ctx.home / "skills_repo").resolve()
     if alt != rec.resolve():
         notes.append("alternative: %s (this WSL filesystem only — Windows agents cannot see it)" % alt)
     notes.append("reason: " + why)
 
-    if not _interactive():
+    if not _interactive(ctx):
         notes.append("non-interactive: using the recommended path (pass --repo to change it)")
         return rec.resolve(), "recommended default", notes
 
     log("")
-    log("Where should the skills repo live on this machine?")
+    log("Where should skills_repo live on this machine?")
     log("  1) %s   <- recommended (%s)" % (rec, why))
     if alt != rec.resolve():
         log("  2) %s   (WSL-only: Windows agents will not see these skills)" % alt)
@@ -1024,49 +1406,58 @@ def cmd_init(ctx):
     args = ctx.args
     repo, repo_source, repo_notes = choose_repo(ctx, args)
     ctx.repo = repo
+    ctx.config = ctx._load_config()
+    ctx.state = ctx._load_state()
     problem = _validate_repo_path(ctx, repo)
     if problem:
         die("refusing repo path %s: %s" % (repo, problem))
     if os.environ.get("SKILLKIT_HOME") and not ctx._within(repo, ctx.home):
         die("sandbox mode: SKILLKIT_HOME is set, so the repo must stay inside %s (got %s)" % (ctx.home, repo))
 
-    log("== skillkit init ==")
-    log("repo        : %s   [%s]" % (repo, repo_source))
+    ctx.log("== skillkit init ==")
+    ctx.log("repo        : %s   [%s]" % (repo, repo_source))
     for note in repo_notes:
-        log("              " + note)
-    log("environment : %s%s" % ("WSL" if ctx.wsl else ("Windows" if os.name == "nt" else "POSIX"),
-                                " (home: %s)" % ctx.home))
-    log("mode        : %s" % ("APPLY" if ctx.apply else "DRY-RUN (add --apply to execute)"))
+        ctx.log("              " + note)
+    ctx.log("environment : %s%s" % ("WSL" if ctx.wsl else ("Windows" if os.name == "nt" else "POSIX"),
+                                    " (home: %s)" % ctx.home))
+    ctx.log("mode        : %s" % ("APPLY" if ctx.apply else "DRY-RUN (add --apply to execute)"))
     if repo.exists() and not repo.is_dir():
         die("%s exists and is not a directory" % repo)
-    log("scope       : only the CURRENT user's home (%s); project-level and other users' dirs untouched" % ctx.home)
-    log("conflict    : keep the NEWEST copy by default (--prefer majority to override)")
-    log("removal     : moves into %s/trash/, never deletes; deletion needs a separate confirmation" % STATE_DIR)
-    if ctx.wsl and str(repo).startswith("/mnt/") is False:
-        log("  note: repo lives inside the WSL filesystem, so Windows-side agents cannot use it.")
-        log("        For dual WSL+Windows use, put the repo on a Windows drive (e.g. /mnt/d/skills-repo).")
+    ctx.log("scope       : only the CURRENT user's home (%s); project-level and other users' dirs untouched" % ctx.home)
+    ctx.log("conflict    : keep the NEWEST copy by default (--prefer majority to override)")
+    ctx.log("removal     : moves into %s/trash/, never deletes; deletion needs a separate confirmation" % STATE_DIR)
+    if ctx.wsl and not str(repo).startswith("/mnt/"):
+        ctx.log("  note: repo lives inside the WSL filesystem, so Windows-side agents cannot use it.")
+        ctx.log("        For dual WSL+Windows use, put the repo on a Windows drive (e.g. /mnt/d/skills_repo).")
 
     # ---- 1. repo + remote ----------------------------------------------
     remote_url = args.repo_url
     if repo.exists() and git_is_repo(repo):
-        log("\n[1/5] repo already exists (%s)" % repo)
+        ctx.log("\n[1/5] repo already exists (%s)" % repo)
     else:
-        log("\n[1/5] %s %s" % ("would create" if not ctx.apply else "creating", repo))
+        ctx.log("\n[1/5] %s %s" % ("would create" if not ctx.apply else "creating", repo))
         if ctx.apply:
             repo.mkdir(parents=True, exist_ok=True)
-            git(repo, "init", "-b", "main")
-            git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
+            rc, _, _ = git(repo, "init", "-b", "main")
+            if rc != 0:
+                git(repo, "init", check=True)
+                git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
 
+    prefer = getattr(args, "prefer", None) or ctx.config.get("conflict_policy") or "newest"
     if ctx.apply:
         ctx.ensure_scaffolding()
+        ctx.config["conflict_policy"] = prefer
+        if "auto_push" not in ctx.config:
+            ctx.config["auto_push"] = True
+        ctx.save_config()
         readme = repo / "README.md"
-        template = Path(__file__).resolve().parent.parent / "assets" / "repo-readme-template.md"
+        template = SELF_SKILL_ROOT / "assets" / "repo-readme-template.md"
         if not readme.is_file() and template.is_file():
             readme.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
 
     # remote handling
     if remote_url:
-        log("   remote: %s" % remote_url)
+        ctx.log("   remote: %s" % remote_url)
         if ctx.apply:
             rc, out, _ = git(repo, "remote")
             if "origin" in out.split():
@@ -1078,38 +1469,37 @@ def cmd_init(ctx):
         if rc != 0:
             die("gh is installed but not authenticated. Run: gh auth login")
         if repo.exists() and git_has_remote(repo):
-            log("   remote: already configured, skipping gh repo create")
+            ctx.log("   remote: already configured, skipping gh repo create")
         else:
-            rc, out, err = sh(["gh", "repo", "create", "%s/skills-repo" % login, "--private", "--source", str(repo), "--push"])
+            rc, out, err = sh(["gh", "repo", "create", "%s/skills_repo" % login, "--private", "--source", str(repo)])
             if rc != 0:
-                log("   ! gh repo create failed: %s" % (err or out))
+                ctx.log("   ! gh repo create failed: %s" % (err or out))
             else:
-                log("   created private repo %s/skills-repo" % login)
-    elif ctx.apply:
+                ctx.log("   created private repo %s/skills_repo" % login)
+    elif ctx.apply and not git_has_remote(repo):
         if have_gh():
-            log("   remote: none yet -> add with: git -C %s remote add origin <url> && git push -u origin HEAD" % repo)
-            log("           (or re-run with --create-remote to create <you>/skills-repo via gh)")
+            ctx.log("   remote: none yet -> add with: git -C %s remote add origin <url> && git -C %s push -u origin HEAD" % (repo, repo))
+            ctx.log("           (or re-run with --create-remote to create <you>/skills_repo via gh)")
         else:
-            log("   remote: no authenticated 'gh' CLI found.")
-            log("           create the private repo in the browser, then:")
-            log("             git -C %s remote add origin git@github.com:<you>/skills-repo.git" % repo)
-            log("             git -C %s push -u origin HEAD" % repo)
+            ctx.log("   remote: no authenticated 'gh' CLI found.")
+            ctx.log("           create a private repo on GitHub (e.g. skills_repo), then:")
+            ctx.log("             git -C %s remote add origin git@github.com:<you>/skills_repo.git" % repo)
+            ctx.log("             git -C %s push -u origin HEAD" % repo)
 
     # ---- 2. scan --------------------------------------------------------
     inc_win = bool(args.include_windows)
     homes = ctx.env_homes(include_windows=inc_win)
-    log("\n[2/5] scanning %d environment(s) for existing skills" % len(homes))
+    ctx.log("\n[2/5] scanning %d environment(s) for existing skills" % len(homes))
     found = []
     for env, home in homes.items():
         got = scan_env(ctx, env, home)
         found.extend(got)
-        log("  %-8s %-4d skill copies  (home: %s)" % (env, len(got), home))
+        ctx.log("  %-8s %-4d skill copies  (home: %s)" % (env, len(got), home))
     for note in ctx.environment_notes:
-        log("  note: " + note)
+        ctx.log("  note: " + note)
     if not inc_win and ctx.wsl:
-        log("  note: Windows-side agent dirs are not scanned. Add --include-windows to include the CURRENT Windows user.")
+        ctx.log("  note: Windows-side agent dirs are not scanned. Add --include-windows to include the CURRENT Windows user.")
 
-    prefer = getattr(args, "prefer", None) or ctx.config.get("conflict_policy") or "newest"
     existing = repo_skills(repo) if repo.is_dir() else []
     existing_names = {s["name"] for s in existing}
     groups = group_by_name(found)
@@ -1118,12 +1508,14 @@ def cmd_init(ctx):
     repo_by_name = {s["name"]: s for s in existing}
     for name, copies in sorted(groups.items()):
         rejected = [c for c in copies if c.get("managed_by")]
-        real = [c for c in copies if c.get("kind") != "symlink" and not c.get("managed_by")]
+        real = [c for c in copies if c.get("kind") == "dir" and not c.get("managed_by")]
         if rejected:
             plan_foreign.extend(rejected)
         if not real:
             if any(c.get("own") for c in copies):
                 why = "already linked to this repo"
+            elif any(c.get("is_self") for c in copies):
+                why = "skill-manager itself"
             elif rejected:
                 why = rejected[0]["managed_by"]
             else:
@@ -1131,15 +1523,14 @@ def cmd_init(ctx):
             plan_skip.append((name, why, copies[0]))
             continue
         if name in existing_names:
-            # Already in the repo: the agent-side copies are redundant. Back them
-            # up and step aside so the link can take their place.
             repo_hash = dir_hash(repo_by_name[name]["path"])
             for c in real:
                 c["same_as_repo"] = (c["hash"] == repo_hash)
                 plan_backup.append(c)
             plan_skip.append((name, "already in repo (agent copies replaced by links)", real[0]))
             continue
-        canon, variants = pick_canonical(copies, prefer)
+        # Only adoptable real copies participate in conflict resolution (never foreign-managed dirs)
+        canon, variants = pick_canonical(real, prefer)
         if canon is None:
             continue
         plan_import.append({"name": name, "canonical": canon, "variants": variants, "copies": real})
@@ -1153,60 +1544,61 @@ def cmd_init(ctx):
         if args.no_dedupe:
             for c in real:
                 if c is not canon and c["hash"] != canon["hash"]:
-                    # keep the divergent copy where it is: it will block linking
                     plan_skip.append((name, "divergent copy kept as-is (--no-dedupe)", c))
 
-    log("\n[3/5] plan")
-    log("  import : %d" % len(plan_import))
+    ctx.log("\n[3/5] plan")
+    ctx.log("  import : %d" % len(plan_import))
     for item in plan_import:
         c = item["canonical"]
         conflict = len(item["variants"]) > 1
-        log("    + %-26s <- %s/%s%s" % (item["name"], c["env"], c["target_id"],
-                                        "   [CONFLICT keeping %s]" % human_time(c["mtime"]) if conflict else ""))
+        ctx.log("    + %-26s <- %s/%s%s" % (item["name"], c["env"], c["target_id"],
+                                            "   [CONFLICT keeping %s]" % human_time(c["mtime"]) if conflict else ""))
         if conflict:
-            for h, group in sorted(item["variants"].items(), key=lambda kv: -len(kv[1])):
-                mark = "*" if group[0] is c or h == c["hash"] else " "
-                log("        %s %d copy(ies), newest %s, e.g. %s" % (
+            for h, group in sorted(item["variants"].items(), key=lambda kv: -max(x["mtime"] for x in kv[1])):
+                mark = "*" if h == c["hash"] else " "
+                ctx.log("        %s %d copy(ies), newest %s, e.g. %s" % (
                     mark, len(group), human_time(max(x["mtime"] for x in group)), group[0]["path"]))
-            log("        (policy: --prefer %s; losers are backed up, not destroyed)" % prefer)
+            ctx.log("        (policy: --prefer %s; losers are backed up, not destroyed)" % prefer)
     if plan_backup:
-        log("  replace+backup : %d duplicate copies -> %s/backup/" % (len(plan_backup), STATE_DIR))
+        ctx.log("  replace+backup : %d duplicate copies -> %s/backup/" % (len(plan_backup), STATE_DIR))
         for c in plan_backup:
-            log("    ~ %-26s %s (%s)" % (c["name"], c["path"], human_time(c["mtime"])))
+            ctx.log("    ~ %-26s %s (%s)" % (c["name"], c["path"], human_time(c["mtime"])))
     if plan_skip:
-        log("  skip   : %d" % len(plan_skip))
-        for name, why, c in plan_skip:
-            log("    - %-26s %s" % (name, why))
+        ctx.log("  skip   : %d" % len(plan_skip))
+        for name, why, _ in plan_skip:
+            ctx.log("    - %-26s %s" % (name, why))
     if plan_foreign:
-        log("  left alone (managed by another tool, reported only): %d copy(ies)" % len(plan_foreign))
+        ctx.log("  left alone (managed by another tool, reported only): %d copy(ies)" % len(plan_foreign))
         for c in plan_foreign[:12]:
             arrow = (" -> %s" % c["points_to"]) if c.get("points_to") else ""
-            log("    ! %-26s %s%s  [%s]" % (c["name"], c["path"], arrow, c["managed_by"]))
+            ctx.log("    ! %-26s %s%s  [%s]" % (c["name"], c["path"], arrow, c["managed_by"]))
         if len(plan_foreign) > 12:
-            log("    ... %d more" % (len(plan_foreign) - 12))
+            ctx.log("    ... %d more" % (len(plan_foreign) - 12))
 
     # ---- 3. execute imports --------------------------------------------
     stamp = time.strftime("%Y%m%d-%H%M%S")
     moved = 0
+    copy_kept_paths = set()
     if ctx.apply:
-        log("\n[4/5] migrating")
+        ctx.log("\n[4/5] migrating")
         backup_root = repo / STATE_DIR / "backup" / stamp
         for item in plan_import:
             src = Path(item["canonical"]["path"])
             dest = repo / "skills" / item["name"]
             if dest.exists():
-                log("  ! %s already exists in repo, skipped" % item["name"])
+                ctx.log("  ! %s already exists in repo, skipped" % item["name"])
                 continue
-            copy_tree(src, backup_root / item["canonical"]["env"] / item["name"])
+            backup_dst = _unique_path(backup_root / item["canonical"]["env"], item["name"])
+            copy_tree(src, backup_dst, keep_git=True)
             ctx.state.setdefault("backups", []).append({
-                "name": item["name"], "from": str(src), "backup": str(backup_root / item["canonical"]["env"] / item["name"]),
-                "at": stamp,
+                "name": item["name"], "from": str(src), "backup": str(backup_dst), "at": stamp,
             })
             if args.copy:
-                copy_tree(src, dest)
+                copy_tree(src, dest, keep_git=False)
+                copy_kept_paths.add(_norm_path(src))
             else:
                 shutil.move(str(src), str(dest))
-            log("  + %s" % item["name"])
+            ctx.log("  + %s" % item["name"])
             moved += 1
         for c in plan_backup:
             src = Path(c["path"])
@@ -1214,81 +1606,126 @@ def cmd_init(ctx):
                 continue
             label = "%s@%s" % (c["name"], c["target_id"])
             if not c.get("same_as_repo"):
-                copy_tree(src, backup_root / c["env"] / label)
-            trash = repo / STATE_DIR / "trash" / stamp / c["env"] / label
+                backup_dst = _unique_path(backup_root / c["env"], label)
+                copy_tree(src, backup_dst, keep_git=True)
+            trash = _unique_path(repo / STATE_DIR / "trash" / stamp / c["env"], label)
             trash.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.move(str(src), str(trash))
             except (OSError, shutil.Error) as exc:
-                log("  ! could not move %s: %s" % (src, exc))
+                ctx.log("  ! could not move %s: %s" % (src, exc))
                 continue
-            log("  ~ %s %s (%s)" % ("stepped aside" if c.get("same_as_repo") else "removed duplicate", src,
-                                    "identical to repo" if c.get("same_as_repo") else "backed up"))
+            ctx.log("  ~ %s %s (%s)" % ("stepped aside" if c.get("same_as_repo") else "removed duplicate", src,
+                                        "identical to repo" if c.get("same_as_repo") else "backed up"))
         ctx.ensure_scaffolding()
         ctx.save_state()
-        if moved or plan_backup:
-            git_commit(repo, "import: adopt %d skill(s) into the central repo" % moved)
+        if moved or plan_backup or git_dirty(repo):
+            git_commit(repo, "import: adopt %d skill(s) into skills_repo" % moved)
     else:
-        log("\n[4/5] migration (skipped, dry-run)")
+        ctx.log("\n[4/5] migration (skipped, dry-run)")
 
     # ---- 4. link --------------------------------------------------------
-    log("\n[5/5] linking agents to the repo")
+    ctx.log("\n[5/5] linking agents to skills_repo")
     skills = repo_skills(repo) if repo.is_dir() else []
+    targets = ctx.enabled_targets(create=True)
+    created = errs = 0
+    sync_res = None
     if not ctx.apply:
         planned = len(skills) + len(plan_import)
-        log("  would link %d skill(s) into: %s" % (planned, ", ".join(sorted({r["target"]["id"] for r in ctx.enabled_targets()})) or "(none detected)"))
+        ctx.log("  would link %d skill(s) into: %s" % (
+            planned, ", ".join(sorted({r["target"]["id"] for r in targets})) or "(none detected)"))
     else:
-        created, errs = link_all(ctx, skills, ctx.enabled_targets())
-        log("  linked %d, errors %d" % (created, errs))
-        git_commit(repo, "link: refresh agent symlinks")
-        if args.push:
-            rc, out, err = git(repo, "push", "-u", "origin", "HEAD")
-            log("  push: %s" % ("ok" if rc == 0 else (err or out)))
+        created, errs = link_all(ctx, skills, targets, skip_paths=copy_kept_paths)
+        if copy_kept_paths:
+            ctx.log("  note: --copy kept %d original real dir(s) untouched (skipped linking over them)" % len(copy_kept_paths))
+        ctx.log("  linked %d, errors %d" % (created, errs))
+        git_commit(repo, "link: refresh agent links")
+        should_push = (bool(args.push) or bool(ctx.config.get("auto_push", True))) and not bool(getattr(args, "no_push", False))
+        if should_push and git_has_remote(repo):
+            sync_res = sync_push(ctx, repo, allow_secrets=bool(getattr(args, "allow_secrets", False)))
+            _log_sync_result(ctx, sync_res)
 
+    recorded = False
     if ctx.apply:
-        if ctx.record_location(repo):
-            log("\nremembered repo location in %s" % ctx.location_file())
+        recorded = ctx.record_location(repo)
+        if recorded:
+            ctx.log("\nremembered repo location in %s" % ctx.location_file())
     else:
-        log("\nwould remember the repo location in %s" % ctx.location_file())
-    log("\nDone." if ctx.apply else "\nDry-run complete. Re-run with --apply to execute.")
+        ctx.log("\nwould remember the repo location in %s" % ctx.location_file())
+    ctx.log("\nDone." if ctx.apply else "\nDry-run complete. Re-run with --apply to execute.")
     if ctx.apply and not git_has_remote(repo):
-        log("Next: add a private remote, then 'skillkit push'.")
-    log("Next: 'skillkit doctor' to verify, 'skillkit list' to inspect.")
+        ctx.log("Next: add a private GitHub remote, then 'skillkit push --apply'.")
+    ctx.log("Next: 'skillkit doctor' to verify, 'skillkit list' to inspect.")
+
+    if ctx.json:
+        ctx.emit({
+            "apply": ctx.apply,
+            "repo": str(repo),
+            "repo_source": repo_source,
+            "imported": [i["name"] for i in plan_import],
+            "moved": moved,
+            "backed_up": [str(c["path"]) for c in plan_backup],
+            "skipped": [{"name": n, "reason": w} for n, w, _ in plan_skip],
+            "foreign": [{"name": c["name"], "path": str(c["path"]), "reason": c["managed_by"]} for c in plan_foreign],
+            "targets": sorted({r["target"]["id"] for r in targets}),
+            "linked": created,
+            "errors": errs,
+            "sync": sync_res,
+            "location_recorded": recorded,
+        })
 
 
-def link_all(ctx, skills, targets):
+def link_all(ctx, skills, targets, mode_override=None, skip_paths=None):
+    """Create links for `skills` into `targets`, merging state by normalized link path."""
     created = errs = 0
-    mode = ctx.config.get("link_mode", "auto")
-    keep = []
+    mode = mode_override or ctx.config.get("link_mode", "auto")
+    skip_paths = skip_paths or set()
+    existing_state = {
+        _norm_path(e["path"]): e
+        for e in ctx.state.get("links", [])
+        if e.get("path")
+    }
     for sk in skills:
         for tr in targets:
             root = tr["root"]
             link = root / sk["name"]
+            if _norm_path(link) in skip_paths:
+                continue
             try:
                 root.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                log("  ! cannot create %s: %s" % (root, exc))
+                ctx.log("  ! cannot create %s: %s" % (root, exc))
                 errs += 1
                 continue
             if link_points_to(link, sk["path"]):
-                keep.append({"name": sk["name"], "path": str(link), "target": str(sk["path"]),
-                             "env": tr["env"], "target_id": tr["target"]["id"], "kind": "existing"})
+                existing_state[_norm_path(link)] = {
+                    "name": sk["name"], "path": str(link), "target": str(sk["path"]),
+                    "env": tr["env"], "target_id": tr["target"]["id"],
+                    "kind": "junction" if is_junction(link) else "symlink",
+                }
                 continue
-            if link.exists() or link.is_symlink():
-                if not (link.is_symlink() or is_junction(link)):
-                    log("  ! %s is a REAL directory, not a link -> left untouched (run 'skillkit doctor' for details)" % link)
+            if link.exists() or is_skill_link(link):
+                if not is_skill_link(link):
+                    ctx.log("  ! %s is a REAL directory, not a link -> left untouched (run 'skillkit doctor' for details)" % link)
                     errs += 1
+                    continue
+                if not is_our_link(link, ctx.repo):
+                    if is_self_skill(link):
+                        continue
+                    ctx.log("  ! %s is a link managed by another tool -> left untouched" % link)
                     continue
                 remove_link(link)
             try:
                 kind = make_link(sk["path"], link, mode=mode, env=tr["env"])
-                keep.append({"name": sk["name"], "path": str(link), "target": str(sk["path"]),
-                             "env": tr["env"], "target_id": tr["target"]["id"], "kind": kind})
+                existing_state[_norm_path(link)] = {
+                    "name": sk["name"], "path": str(link), "target": str(sk["path"]),
+                    "env": tr["env"], "target_id": tr["target"]["id"], "kind": kind,
+                }
                 created += 1
             except (RuntimeError, OSError, shutil.Error) as exc:
-                log("  ! link failed %s: %s" % (link, exc))
+                ctx.log("  ! link failed %s: %s" % (link, exc))
                 errs += 1
-    ctx.state["links"] = keep + [l for l in ctx.state.get("links", []) if l["name"] not in {k["name"] for k in keep}]
+    ctx.state["links"] = sorted(existing_state.values(), key=lambda x: (x.get("name", ""), x.get("path", "")))
     ctx.save_state()
     return created, errs
 
@@ -1308,50 +1745,67 @@ def cmd_link(ctx):
         targets = ctx.targets_by_id([x.strip() for x in ctx.args.to.split(",") if x.strip()],
                                     include_windows=bool(ctx.args.include_windows))
     else:
-        targets = ctx.enabled_targets()
-    if ctx.args.mode:
-        ctx.config["link_mode"] = ctx.args.mode
-    log("linking %d skill(s) into %d target dir(s) [%s]" % (len(skills), len(targets),
-                                                           "APPLY" if ctx.apply else "DRY-RUN"))
+        targets = ctx.enabled_targets(create=True)
+    mode_override = ctx.args.mode or None
+    ctx.log("linking %d skill(s) into %d target dir(s) [%s]" % (
+        len(skills), len(targets), "APPLY" if ctx.apply else "DRY-RUN"))
+    planned = [{"skill": sk["name"], "link": str(tr["root"] / sk["name"]),
+                "target_id": tr["target"]["id"], "env": tr["env"]}
+               for sk in skills for tr in targets]
     if not ctx.apply:
-        for sk in skills:
-            for tr in targets:
-                log("  %-28s -> %s" % (sk["name"], tr["root"] / sk["name"]))
-        log("\nDry-run complete. Re-run with --apply.")
+        for item in planned:
+            ctx.log("  %-28s -> %s" % (item["skill"], item["link"]))
+        ctx.log("\nDry-run complete. Re-run with --apply.")
+        if ctx.json:
+            ctx.emit({"apply": False, "planned": planned})
         return
-    created, errs = link_all(ctx, skills, targets)
-    log("linked %d, errors %d" % (created, errs))
-    git_commit(repo, "link: refresh agent symlinks")
+    created, errs = link_all(ctx, skills, targets, mode_override=mode_override)
+    ctx.log("linked %d, errors %d" % (created, errs))
+    git_commit(repo, "link: refresh agent links")
+    if ctx.json:
+        ctx.emit({"apply": True, "linked": created, "errors": errs, "planned": planned})
 
 
 def cmd_unlink(ctx):
-    ctx.require_repo()
+    repo = ctx.require_repo()
     names = set(ctx.args.names or [])
+    if not names and not ctx.args.all:
+        die("specify skill name(s) to unlink, or pass --all to unlink every skill")
+    live_links = discover_our_links(ctx, repo)
+    matched = [e for e in live_links if not names or e["name"] in names]
     removed = 0
-    for entry in list(ctx.state.get("links", [])):
-        if names and entry["name"] not in names:
-            continue
+    actions = []
+    for entry in matched:
         link = Path(entry["path"])
-        if link.is_symlink() or is_junction(link):
-            if not ctx.apply:
-                log("would unlink %s" % link)
-                continue
-            if remove_link(link):
-                log("unlinked %s" % link)
-                removed += 1
-            else:
-                log("  ! could not unlink %s (real directory?)" % link)
-            ctx.state["links"] = [e for e in ctx.state["links"] if e["path"] != entry["path"]]
+        if not ctx.apply:
+            ctx.log("would unlink %s" % link)
+            actions.append({"name": entry["name"], "path": str(link), "status": "would_unlink"})
+            continue
+        if remove_link(link):
+            ctx.log("unlinked %s" % link)
+            removed += 1
+            actions.append({"name": entry["name"], "path": str(link), "status": "unlinked"})
+            ctx.state["links"] = [
+                e for e in ctx.state.get("links", [])
+                if _norm_path(e["path"]) != _norm_path(link)
+            ]
+        else:
+            ctx.log("  ! could not unlink %s (real directory?)" % link)
+            actions.append({"name": entry["name"], "path": str(link), "status": "failed"})
     if ctx.apply:
         ctx.save_state()
-        log("removed %d link(s)" % removed)
+        ctx.log("removed %d link(s)" % removed)
+    else:
+        ctx.log("\nDry-run complete. Re-run with --apply.")
+    if ctx.json:
+        ctx.emit({"apply": ctx.apply, "removed": removed, "actions": actions})
 
 
 def cmd_list(ctx):
     repo = ctx.require_repo()
     skills = repo_skills(repo)
     links = {}
-    for entry in ctx.state.get("links", []):
+    for entry in discover_our_links(ctx, repo):
         links.setdefault(entry["name"], []).append(entry)
     rows = []
     for sk in skills:
@@ -1379,14 +1833,15 @@ def cmd_repo(ctx):
         if problem:
             die("refusing %s: %s" % (path, problem))
         ok = ctx.record_location(path)
-        log("repo location set to %s  (%s)" % (path, "saved" if ok else "NOT saved"))
+        ctx.emit({"repo": str(path), "saved": ok, "location_file": str(loc)},
+                 "repo location set to %s  (%s)" % (path, "saved" if ok else "NOT saved"))
         return
     if ctx.args.forget:
-        if loc.is_file():
-            os.unlink(str(loc))          # one explicit path, the pointer file only
-            log("forgot the recorded location (%s removed)" % loc)
-        else:
-            log("nothing recorded (%s does not exist)" % loc)
+        existed = loc.is_file()
+        if existed:
+            os.unlink(str(loc))  # one explicit path, the pointer file only
+        ctx.emit({"forgot": existed, "location_file": str(loc)},
+                 ("forgot the recorded location (%s removed)" % loc) if existed else ("nothing recorded (%s does not exist)" % loc))
         return
     rec, why = _recommended_repo(ctx)
     info = {
@@ -1410,11 +1865,17 @@ def cmd_repo(ctx):
 def cmd_status(ctx):
     repo = ctx.require_repo()
     skills = repo_skills(repo)
-    links = ctx.state.get("links", [])
-    broken = [l for l in links if not link_points_to(l["path"], l["target"])]
+    skill_by_name = {s["name"]: s for s in skills}
+    links = discover_our_links(ctx, repo)
+    broken = []
+    for l in links:
+        sk = skill_by_name.get(l["name"])
+        if not sk or not link_points_to(l["path"], sk["path"]):
+            broken.append(l)
     info = {
         "repo": str(repo),
         "repo_source": ctx.repo_source,
+        "auto_push": bool(ctx.config.get("auto_push", True)),
         "git": {
             "is_repo": git_is_repo(repo),
             "dirty": git_dirty(repo),
@@ -1425,25 +1886,28 @@ def cmd_status(ctx):
         "links": len(links),
         "broken_links": len(broken),
         "targets": [{"id": r["target"]["id"], "env": r["env"], "path": str(r["root"]),
-                     "exists": r["root"].is_dir()} for r in ctx.enabled_targets()],
+                     "exists": r["root"].is_dir()} for r in ctx.enabled_targets(create=True)],
     }
     text = [
         "repo      : %s   [%s]" % (info["repo"], info.get("repo_source", "?")),
         "git       : %s%s%s" % ("ok" if info["git"]["is_repo"] else "NOT A REPO",
                                 " (dirty)" if info["git"]["dirty"] else "",
                                 "" if info["git"]["remote"] else " (no remote)"),
+        "auto_push : %s" % ("on" if info["auto_push"] else "off"),
         "skills    : %d" % info["skills"],
         "links     : %d total, %d broken" % (info["links"], info["broken_links"]),
     ]
     for t in info["targets"]:
-        text.append("target    : %-9s %-8s %s" % (t["id"], t["env"], t["path"]))
+        text.append("target    : %-13s %-8s %s%s" % (
+            t["id"], t["env"], t["path"], "" if t["exists"] else " (will create on apply)"))
     ctx.emit(info, "\n".join(text))
 
 
-def cmd_doctor(ctx):
-    repo = ctx.require_repo()
+def _run_doctor_checks(ctx, repo):
     problems, warnings = [], []
     skills = repo_skills(repo)
+    skill_by_name = {s["name"]: s for s in skills}
+    targets = ctx.enabled_targets(create=True)
 
     # 1. frontmatter / naming
     seen = {}
@@ -1460,40 +1924,45 @@ def cmd_doctor(ctx):
             problems.append("duplicate skill name '%s' in %s and %s" % (sk["name"], seen[sk["name"]], sk["rel"]))
         seen[sk["name"]] = sk["rel"]
 
-    # 2. links
-    for entry in ctx.state.get("links", []):
-        link, target = Path(entry["path"]), Path(entry["target"])
-        if not target.exists():
-            problems.append("link %s points at missing skill %s" % (link, target))
-        elif not link.exists() and not link.is_symlink():
-            problems.append("missing link %s -> %s" % (link, target))
-        elif not link_points_to(link, target):
-            problems.append("stale link %s (expected -> %s)" % (link, target))
+    # 2. live + dangling links pointing into this repo
+    for entry in discover_our_links(ctx, repo, targets=targets):
+        link = Path(entry["path"])
+        target = Path(entry["target"]) if entry["target"] else None
+        if not target or not target.exists():
+            problems.append("dangling link %s -> missing %s" % (link, target or "?"))
+        else:
+            sk = skill_by_name.get(entry["name"])
+            if sk and not link_points_to(link, sk["path"]):
+                problems.append("stale link %s (expected -> %s)" % (link, sk["path"]))
 
     # 3. expected links for enabled targets
     expected = 0
-    for tr in ctx.enabled_targets():
+    for tr in targets:
         for sk in skills:
             expected += 1
             link = tr["root"] / sk["name"]
-            if not (link.exists() or link.is_symlink()):
+            if not (link.exists() or is_skill_link(link)):
                 problems.append("not linked: %s (target %s)" % (sk["name"], tr["root"]))
+            elif is_skill_link(link) and is_our_link(link, repo) and not link_points_to(link, sk["path"]):
+                msg = "stale link %s (expected -> %s)" % (link, sk["path"])
+                if msg not in problems:
+                    problems.append(msg)
 
     # 4. foreign / unmanaged skills inside agent dirs
-    for tr in ctx.enabled_targets():
+    for tr in targets:
         root = tr["root"]
         if not root.is_dir():
             continue
-        for entry in root.iterdir():
-            if entry.name.startswith(".") or not (entry.is_dir() or entry.is_symlink()):
+        for entry in sorted(root.iterdir()):
+            if entry.name.startswith(".") or not (entry.is_dir() or is_skill_link(entry)):
                 continue
-            if not (entry.is_symlink() or is_junction(entry)) and not is_skill_dir(entry):
-                continue          # not a skill directory (cache, notes, .system...) — ignore
-            if entry.is_symlink() or is_junction(entry):
-                if not is_our_link(entry, repo):
-                    warnings.append("left alone in %s: %s [%s]"
-                                    % (root, entry.name, foreign_reason(entry, repo)))
-                continue          # our own link = desired state, nothing to report
+            if not is_skill_link(entry) and not is_skill_dir(entry):
+                continue  # not a skill directory (cache, notes, .system...) — ignore
+            if is_skill_link(entry):
+                if is_our_link(entry, repo) or is_self_skill(entry):
+                    continue
+                warnings.append("left alone in %s: %s [%s]" % (root, entry.name, foreign_reason(entry, repo)))
+                continue
             reason = foreign_reason(entry, repo)
             if reason:
                 warnings.append("left alone in %s: %s [%s]" % (root, entry.name, reason))
@@ -1501,42 +1970,45 @@ def cmd_doctor(ctx):
             problems.append("unmanaged real directory in %s: %s (run 'skillkit init --apply' to adopt)" % (root, entry.name))
 
     # 5. secrets
-    for sk in skills:
-        for cur, dirs, files in os.walk(sk["path"]):
-            dirs[:] = [d for d in dirs if d.lower() not in IGNORE_DIR_NAMES]
-            for name in files:
-                fp = Path(cur) / name
-                if any(h in name.lower() for h in SECRET_FILE_HINTS):
-                    warnings.append("possible secret file: %s" % fp)
-                    continue
-                if fp.stat().st_size > 512 * 1024:
-                    continue
-                try:
-                    text = fp.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                for rx, label in SECRET_PATTERNS:
-                    if rx.search(text):
-                        warnings.append("%s in %s" % (label, fp))
-                        break
+    for f in scan_secrets(repo):
+        warnings.append("%s: %s" % (f["reason"], f["rel"]))
 
     # 6. git state
     info = {"skills": len(skills), "expected_links": expected}
     if git_is_repo(repo):
         if git_dirty(repo):
-            warnings.append("repo has uncommitted changes (run 'skillkit push')")
+            warnings.append("repo has uncommitted changes (run 'skillkit push --apply')")
         if not git_has_remote(repo):
             warnings.append("repo has no git remote (no off-machine backup)")
     else:
         problems.append("%s is not a git repository" % repo)
 
-    if ctx.args.fix and problems:
-        log("attempting repair of missing/broken links ...")
-        created, errs = link_all(ctx, skills, ctx.enabled_targets())
-        log("relinked %d, errors %d" % (created, errs))
-        problems = [p for p in problems if not p.startswith(("missing link", "not linked", "stale link"))]
+    return skills, targets, problems, warnings, info
+
+
+def cmd_doctor(ctx):
+    repo = ctx.require_repo()
+    skills, targets, problems, warnings, info = _run_doctor_checks(ctx, repo)
+    repaired = None
+
+    if ctx.args.fix:
+        dangling = prune_dangling_links(ctx, repo, targets=targets, apply=False)
+        if not ctx.apply:
+            ctx.log("doctor --fix [DRY-RUN]: add --apply to repair missing/stale links and prune %d dangling link(s)." % len(dangling))
+            for d in dangling:
+                ctx.log("  would prune dangling link %s" % d["path"])
+        else:
+            ctx.log("repairing missing/stale links and pruning dangling links ...")
+            pruned = prune_dangling_links(ctx, repo, targets=targets, apply=True)
+            created, errs = link_all(ctx, skills, targets)
+            repaired = {"relinked": created, "pruned": len(pruned), "errors": errs}
+            ctx.log("relinked %d, pruned %d, errors %d" % (created, len(pruned), errs))
+            # Re-verify honestly instead of masking failed repairs
+            skills, targets, problems, warnings, info = _run_doctor_checks(ctx, repo)
 
     payload = {"ok": not problems, "problems": problems, "warnings": warnings, "info": info}
+    if repaired is not None:
+        payload["repaired"] = repaired
     if ctx.json:
         ctx.emit(payload)
         return
@@ -1547,155 +2019,317 @@ def cmd_doctor(ctx):
         log("  PROBLEM  %s" % p)
     for w in warnings:
         log("  warning  %s" % w)
-    log("\n%d problem(s), %d warning(s)%s" % (len(problems), len(warnings),
-                                              " (use --fix for link repair)" if problems else ""))
+    log("\n%d problem(s), %d warning(s)%s" % (
+        len(problems), len(warnings),
+        " (use --fix --apply for link repair)" if problems else ""))
 
 
 def cmd_add(ctx):
     args = ctx.args
     repo = ctx.require_repo()
     src = args.source
-    is_url = bool(re.match(r"^(https?://|git@|ssh://)", src))
+    is_url = bool(re.match(r"^(https?://|git@|ssh://|file://)", src))
     tmp = None
-    if is_url:
-        tmp = Path(os.path.join(os.environ.get("TMPDIR", "/tmp"), "skillkit-clone-%d" % int(time.time())))
-        log("cloning %s" % src)
-        rc, out, err = sh(["git", "clone", "--depth", "1", src, str(tmp)])
-        if rc != 0:
-            die("git clone failed: %s" % (err or out))
-        candidates = [p for p in [tmp] + sorted(tmp.iterdir()) if is_skill_dir(p)]
-        if not candidates:
-            sub = [p for p in tmp.rglob(SKILL_FILE) if ".git" not in p.parts]
-            if sub:
-                candidates = [sub[0].parent]
-        if not candidates:
-            die("no SKILL.md found in %s" % src)
-        source_dir = candidates[0]
-    else:
-        source_dir = Path(src).expanduser()
-        if not source_dir.is_dir():
-            die("not a directory: %s" % source_dir)
-        if not is_skill_dir(source_dir):
-            die("no SKILL.md in %s" % source_dir)
+    try:
+        if is_url:
+            tmp = Path(tempfile.mkdtemp(prefix="skillkit-clone-"))
+            ctx.log("cloning %s" % src)
+            rc, out, err = sh(["git", "clone", "--depth", "1", src, str(tmp)])
+            if rc != 0:
+                die("git clone failed: %s" % (err or out))
+            candidates = _discover_skills_in_tree(tmp)
+            if not candidates:
+                die("no SKILL.md found in %s" % src)
+            if len(candidates) > 1:
+                if args.skill:
+                    hits = [c for c in candidates if c.name == args.skill]
+                    if not hits:
+                        die("skill %r not found in repo (available: %s)" % (
+                            args.skill, ", ".join(c.name for c in candidates)))
+                    selected = hits
+                elif args.all:
+                    selected = candidates
+                else:
+                    avail = ", ".join(c.name for c in candidates)
+                    die("multiple skills found in %s (%s). Pass --skill <name> to pick one, or --all to add all."
+                        % (src, avail))
+            else:
+                selected = candidates
+        else:
+            source_dir = Path(src).expanduser().resolve()
+            if not source_dir.is_dir():
+                die("not a directory: %s" % source_dir)
+            if not is_skill_dir(source_dir):
+                die("no SKILL.md in %s" % source_dir)
+            selected = [source_dir]
 
-    name = args.name or source_dir.name      # directory name wins: never rename a skill
-    name = re.sub(r"[^A-Za-z0-9._-]", "-", name.strip())
-    category = args.category
-    dest = repo / "skills" / (category + "/" if category else "") / name
-    log("add %s -> %s [%s]" % (name, dest, "APPLY" if ctx.apply else "DRY-RUN"))
-    if dest.exists():
-        if not args.force:
-            die("%s already exists in the repo (use --force to replace; old copy goes to .trash)" % name)
-        log("  replacing existing copy (moved to %s/trash/)" % STATE_DIR)
-        if ctx.apply:
-            trash = repo / STATE_DIR / "trash" / time.strftime("%Y%m%d-%H%M%S") / name
-            trash.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest), str(trash))
-    if not ctx.apply:
-        log("dry-run complete. Re-run with --apply.")
-        return
-    copy_tree(source_dir, dest)
-    if tmp and tmp.exists():
-        # single, explicit path; no recursive delete of user data
-        shutil.move(str(tmp), str(repo / STATE_DIR / "trash" / ("clone-" + str(int(time.time())))))
-    if is_url:
-        ctx.config.setdefault("sources", {})[name] = src
-        ctx.save_config()
-    ctx.ensure_scaffolding()
-    git_commit(repo, "add: %s" % name)
-    if not args.no_link:
-        created, errs = link_all(ctx, [s for s in repo_skills(repo) if s["name"] == name], ctx.enabled_targets())
-        log("linked %d, errors %d" % (created, errs))
-    log("done. 'skillkit push' to publish.")
+        existing_by_name = {s["name"]: s for s in repo_skills(repo)}
+        plan = []
+        for sdir in selected:
+            if args.name and len(selected) == 1:
+                raw_name = args.name
+            elif tmp and same_path(sdir, tmp):
+                raw_name = _repo_name_from_url(src)
+            else:
+                raw_name = sdir.name  # directory name wins: never rename a skill
+            name = re.sub(r"[^A-Za-z0-9._-]", "-", raw_name.strip())
+            category = args.category
+            dest = repo / "skills" / (category + "/" if category else "") / name
+            existing = existing_by_name.get(name)
+            if existing and not args.force:
+                die("%s already exists in the repo at %s (use --force to replace; old copy goes to %s/trash/)"
+                    % (name, existing["rel"], STATE_DIR))
+            plan.append({"name": name, "source_dir": sdir, "dest": dest, "existing": existing})
+
+        for item in plan:
+            ctx.log("add %s -> %s [%s]" % (item["name"], item["dest"], "APPLY" if ctx.apply else "DRY-RUN"))
+            if item["existing"]:
+                ctx.log("  replacing existing copy at %s (moved to %s/trash/)" % (item["existing"]["rel"], STATE_DIR))
+
+        will_push = bool(ctx.config.get("auto_push", True)) and not bool(getattr(args, "no_push", False))
+        if not ctx.apply:
+            if will_push and git_has_remote(repo):
+                ctx.log("would auto-push to GitHub remote after commit (pass --no-push to skip)")
+            ctx.log("dry-run complete. Re-run with --apply.")
+            if ctx.json:
+                ctx.emit({
+                    "apply": False,
+                    "will_push": will_push and git_has_remote(repo),
+                    "items": [{"name": i["name"], "dest": str(i["dest"]), "replacing": bool(i["existing"])} for i in plan],
+                })
+            return
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        added_names = []
+        for item in plan:
+            if item["existing"]:
+                old_path = Path(item["existing"]["path"])
+                if old_path.exists():
+                    trash = _unique_path(repo / STATE_DIR / "trash" / stamp, item["name"])
+                    trash.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(old_path), str(trash))
+            elif item["dest"].exists():
+                trash = _unique_path(repo / STATE_DIR / "trash" / stamp, item["name"])
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item["dest"]), str(trash))
+            copy_tree(item["source_dir"], item["dest"], keep_git=False)
+            added_names.append(item["name"])
+            if is_url:
+                ctx.config.setdefault("sources", {})[item["name"]] = src
+
+        if is_url or not (repo / CONFIG_NAME).is_file():
+            ctx.save_config()
+        ctx.ensure_scaffolding()
+        git_commit(repo, "add: %s" % ", ".join(added_names))
+
+        created = errs = 0
+        if not args.no_link:
+            added_skills = [s for s in repo_skills(repo) if s["name"] in set(added_names)]
+            created, errs = link_all(ctx, added_skills, ctx.enabled_targets(create=True))
+            ctx.log("linked %d, errors %d" % (created, errs))
+
+        sync_res = None
+        if will_push:
+            sync_res = sync_push(ctx, repo, allow_secrets=bool(getattr(args, "allow_secrets", False)))
+            _log_sync_result(ctx, sync_res)
+        else:
+            ctx.log("done (auto-push disabled). Run 'skillkit push --apply' to publish.")
+
+        if ctx.json:
+            ctx.emit({
+                "apply": True,
+                "added": added_names,
+                "linked": created,
+                "errors": errs,
+                "sync": sync_res,
+            })
+    finally:
+        _cleanup_temp_dir(tmp)
 
 
 def cmd_update(ctx):
+    args = ctx.args
     repo = ctx.require_repo()
     sources = ctx.config.get("sources", {})
-    names = ctx.args.names or sorted(sources)
+    names = args.names or sorted(sources)
     if not names:
         die("no recorded upstream sources; use 'skillkit add <url>' first")
+
+    repo_by_name = {s["name"]: s for s in repo_skills(repo)}
+    updated, skipped, failed = [], [], []
+    will_push = bool(ctx.config.get("auto_push", True)) and not bool(getattr(args, "no_push", False))
+
     for name in names:
         url = sources.get(name)
         if not url:
-            log("skip %s: no recorded source" % name)
+            ctx.log("skip %s: no recorded source" % name)
+            skipped.append({"name": name, "reason": "no recorded source"})
             continue
-        dest = repo / "skills" / name
-        if not dest.is_dir():
-            hits = [s for s in repo_skills(repo) if s["name"] == name]
-            if not hits:
-                log("skip %s: not in repo" % name)
-                continue
-            dest = hits[0]["path"]
-        log("update %s <- %s [%s]" % (name, url, "APPLY" if ctx.apply else "DRY-RUN"))
+        sk = repo_by_name.get(name)
+        if not sk:
+            ctx.log("skip %s: not in repo" % name)
+            skipped.append({"name": name, "reason": "not in repo"})
+            continue
+        dest = Path(sk["path"])
+        ctx.log("update %s <- %s [%s]" % (name, url, "APPLY" if ctx.apply else "DRY-RUN"))
         if not ctx.apply:
             continue
-        tmp = Path(os.path.join(os.environ.get("TMPDIR", "/tmp"), "skillkit-upd-%d" % int(time.time())))
-        rc, out, err = sh(["git", "clone", "--depth", "1", url, str(tmp)])
-        if rc != 0:
-            log("  ! clone failed: %s" % (err or out))
-            continue
-        cands = [p for p in [tmp] + sorted(tmp.iterdir()) if is_skill_dir(p)]
-        if not cands:
-            log("  ! no SKILL.md upstream")
-            continue
-        trash = repo / STATE_DIR / "trash" / time.strftime("%Y%m%d-%H%M%S") / name
-        trash.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(dest), str(trash))
-        copy_tree(cands[0], dest)
-        shutil.move(str(tmp), str(repo / STATE_DIR / "trash" / ("upd-" + str(int(time.time())))))
-        log("  updated")
-    if ctx.apply:
-        git_commit(repo, "update: refresh from upstream")
-        log("done. 'skillkit push' to publish.")
+        tmp = None
+        staging = None
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="skillkit-upd-"))
+            rc, out, err = sh(["git", "clone", "--depth", "1", url, str(tmp)])
+            if rc != 0:
+                msg = err or out
+                ctx.log("  ! clone failed: %s" % msg)
+                failed.append({"name": name, "reason": msg})
+                continue
+            cands = _discover_skills_in_tree(tmp)
+            if not cands:
+                ctx.log("  ! no SKILL.md upstream")
+                failed.append({"name": name, "reason": "no SKILL.md upstream"})
+                continue
+            chosen = next((c for c in cands if c.name == name), cands[0])
+            # Copy to sibling staging dir first so the existing skill stays intact on copy error
+            staging = dest.parent / (".skillkit-staging-%s-%d" % (name, int(time.time())))
+            copy_tree(chosen, staging, keep_git=False)
+            trash = _unique_path(repo / STATE_DIR / "trash" / time.strftime("%Y%m%d-%H%M%S"), name)
+            trash.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dest), str(trash))
+            shutil.move(str(staging), str(dest))
+            staging = None
+            updated.append(name)
+            ctx.log("  updated")
+        except (OSError, shutil.Error) as exc:
+            ctx.log("  ! update failed: %s" % exc)
+            failed.append({"name": name, "reason": str(exc)})
+        finally:
+            _cleanup_temp_dir(tmp)
+            if staging and staging.exists():
+                trash_st = _unique_path(repo / STATE_DIR / "trash" / time.strftime("%Y%m%d-%H%M%S"), name + "-staging")
+                trash_st.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(staging), str(trash_st))
+                except OSError:
+                    pass
+
+    sync_res = None
+    created = errs = 0
+    if not ctx.apply:
+        if will_push and git_has_remote(repo):
+            ctx.log("would auto-push to GitHub remote after commit (pass --no-push to skip)")
+        ctx.log("dry-run complete. Re-run with --apply.")
+    else:
+        if updated:
+            git_commit(repo, "update: %s" % ", ".join(updated))
+            refreshed = [s for s in repo_skills(repo) if s["name"] in set(updated)]
+            created, errs = link_all(ctx, refreshed, ctx.enabled_targets(create=True))
+            if will_push:
+                sync_res = sync_push(ctx, repo, allow_secrets=bool(getattr(args, "allow_secrets", False)))
+                _log_sync_result(ctx, sync_res)
+            else:
+                ctx.log("done (auto-push disabled). Run 'skillkit push --apply' to publish.")
+
+    if ctx.json:
+        ctx.emit({
+            "apply": ctx.apply,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+            "linked": created,
+            "errors": errs,
+            "sync": sync_res,
+        })
 
 
 def cmd_remove(ctx):
+    args = ctx.args
     repo = ctx.require_repo()
-    names = ctx.args.names
+    names = args.names
     skills = {s["name"]: s for s in repo_skills(repo)}
+    live_links = discover_our_links(ctx, repo)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    will_push = bool(ctx.config.get("auto_push", True)) and not bool(getattr(args, "no_push", False))
+    removed, skipped = [], []
+
     for name in names:
         sk = skills.get(name)
         if not sk:
-            log("skip %s: not in repo" % name)
+            ctx.log("skip %s: not in repo" % name)
+            skipped.append(name)
             continue
-        log("remove %s [%s]  (links removed, payload MOVED to %s/trash/ — nothing is deleted)"
-            % (name, "APPLY" if ctx.apply else "DRY-RUN", STATE_DIR))
+        ctx.log("remove %s [%s]  (links removed, payload MOVED to %s/trash/ — nothing is deleted)"
+                % (name, "APPLY" if ctx.apply else "DRY-RUN", STATE_DIR))
+        matching_links = [e for e in live_links if e["name"] == name]
         if not ctx.apply:
-            for entry in ctx.state.get("links", []):
-                if entry["name"] == name:
-                    log("  would unlink %s" % entry["path"])
-            log("  would move %s -> %s/trash/<timestamp>/%s" % (sk["path"], STATE_DIR, name))
+            for entry in matching_links:
+                ctx.log("  would unlink %s" % entry["path"])
+            ctx.log("  would move %s -> %s/trash/<timestamp>/%s" % (sk["path"], STATE_DIR, name))
             continue
-        # 1) unlink every agent dir that points at it
-        for entry in list(ctx.state.get("links", [])):
-            if entry["name"] != name:
-                continue
+        # 1) unlink every agent dir that points at it (from filesystem + state)
+        for entry in matching_links:
             link = Path(entry["path"])
-            if link.is_symlink() or is_junction(link):
+            if is_skill_link(link):
                 remove_link(link)
-                log("  unlinked %s" % link)
-            ctx.state["links"] = [e for e in ctx.state.get("links") if e["path"] != entry["path"]]
-        # 2) move the payload to .trash (never delete)
-        trash = repo / STATE_DIR / "trash" / stamp / name
+                ctx.log("  unlinked %s" % link)
+            ctx.state["links"] = [
+                e for e in ctx.state.get("links", [])
+                if _norm_path(e["path"]) != _norm_path(link)
+            ]
+        # 2) move the payload to .skill-manager/trash (never delete)
+        trash = _unique_path(repo / STATE_DIR / "trash" / stamp, name)
         trash.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(sk["path"]), str(trash))
         ctx.config.get("sources", {}).pop(name, None)
-        log("  moved to %s" % trash)
-    if ctx.apply:
+        removed.append({"name": name, "trash": str(trash)})
+        ctx.log("  moved to %s" % trash)
+
+    sync_res = None
+    if not ctx.apply:
+        if will_push and git_has_remote(repo):
+            ctx.log("would auto-push to GitHub remote after commit (pass --no-push to skip)")
+        ctx.log("dry-run complete. Re-run with --apply.")
+    elif removed:
         ctx.save_config()
         ctx.save_state()
-        git_commit(repo, "remove: %s" % ", ".join(names))
-        log("done. Recover from %s/trash/%s/ if this was a mistake." % (STATE_DIR, stamp))
+        git_commit(repo, "remove: %s" % ", ".join(r["name"] for r in removed))
+        if will_push:
+            sync_res = sync_push(ctx, repo, allow_secrets=bool(getattr(args, "allow_secrets", False)))
+            _log_sync_result(ctx, sync_res)
+        ctx.log("done. Recover from %s/trash/%s/ if this was a mistake." % (STATE_DIR, stamp))
+
+    if ctx.json:
+        ctx.emit({"apply": ctx.apply, "removed": removed, "skipped": skipped, "sync": sync_res})
 
 
 def _tree_files(path):
     out = []
-    for cur, dirs, files in os.walk(path):
+    for cur, dirs, files in os.walk(str(path)):
         for name in sorted(files):
             out.append(Path(cur) / name)
     return out
+
+
+def _trash_entries(root):
+    """List top-level trashed items under <repo>/.skill-manager/trash/<ts>/."""
+    rows = []
+    for tsdir in sorted(root.iterdir()):
+        if not tsdir.is_dir():
+            continue
+        for child in sorted(tsdir.iterdir()):
+            # Handles both <ts>/<skill> and <ts>/<env>/<skill@target>
+            if child.is_dir() and child.name in ("local", "windows"):
+                for sub in sorted(child.iterdir()):
+                    rows.append({
+                        "timestamp": tsdir.name, "env": child.name, "name": sub.name,
+                        "path": sub, "files": len(_tree_files(sub)) if sub.is_dir() else 1,
+                    })
+            else:
+                rows.append({
+                    "timestamp": tsdir.name, "env": "", "name": child.name,
+                    "path": child, "files": len(_tree_files(child)) if child.is_dir() else 1,
+                })
+    return rows
 
 
 def cmd_trash(ctx):
@@ -1704,45 +2338,57 @@ def cmd_trash(ctx):
     root = repo / STATE_DIR / "trash"
     args = ctx.args
     if not root.is_dir():
-        log("trash is empty (%s)" % root)
+        ctx.emit({"trash_root": str(root), "items": []}, "trash is empty (%s)" % root)
         return
     if not args.purge:
-        rows = []
-        for tsdir in sorted(root.iterdir()):
-            if not tsdir.is_dir():
-                continue
-            for item in sorted(tsdir.rglob("*")):
-                if item.is_dir() and not any(p.is_dir() for p in item.iterdir()):
-                    rows.append({"timestamp": tsdir.name, "name": item.name, "path": str(item),
-                                 "files": len(_tree_files(item))})
+        entries = _trash_entries(root)
+        rows = [
+            {"timestamp": e["timestamp"], "env": e["env"], "name": e["name"],
+             "path": str(e["path"]), "files": e["files"]}
+            for e in entries
+        ]
+        lines = []
         for r in rows:
-            log("%-16s %-30s %3d file(s)  %s" % (r["timestamp"], r["name"], r["files"], r["path"]))
+            lines.append("%-16s %-30s %3d file(s)  %s" % (r["timestamp"], r["name"], r["files"], r["path"]))
         if not rows:
-            log("trash is empty")
-        log("\nNothing deleted. 'skillkit trash --purge <name>' lists exact files and requires")
-        log("both --confirm-delete and an explicit yes before deleting anything one path at a time.")
-        ctx.emit({"trash_root": str(root), "items": rows})
+            lines.append("trash is empty")
+        lines.append("\nNothing deleted. 'skillkit trash --purge <name>' lists exact files and requires")
+        lines.append("both --confirm-delete and an explicit yes before deleting anything one path at a time.")
+        ctx.emit({"trash_root": str(root), "items": rows}, "\n".join(lines))
         return
 
-    # ---- purge: two gates, exact paths, one unlink per file ---------------
+    # ---- purge: two gates, entry-level matching only, one unlink per file --
     needle = args.purge
-    victims = [p for p in root.rglob(needle) if p.exists() or p.is_symlink()]
+    entries = _trash_entries(root)
     if needle == "all":
-        victims = [p for p in root.iterdir()]
+        victims = [p for p in sorted(root.iterdir())]
+    else:
+        victims = [
+            e["path"] for e in entries
+            if e["name"] == needle or e["timestamp"] == needle
+            or ("%s/%s" % (e["timestamp"], e["name"])) == needle
+        ]
+        # Also allow exact timestamp dir match when it contains multiple entries
+        ts_exact = root / needle
+        if ts_exact.is_dir() and ts_exact not in victims:
+            victims = [ts_exact]
     if not victims:
-        die("no trash entry matches %r" % needle)
+        die("no trash entry matches %r (run 'skillkit trash' to see exact entry names/timestamps)" % needle)
+
     files = []
     for v in victims:
-        files.extend([v] if v.is_file() or v.is_symlink() else _tree_files(v))
-    log("About to DELETE %d file(s) from %d trash entr(ies):" % (len(files), len(victims)))
+        files.extend([v] if v.is_file() or is_skill_link(v) else _tree_files(v))
+    ctx.log("About to DELETE %d file(s) from %d trash entr(ies):" % (len(files), len(victims)))
     for f in files[:200]:
-        log("  " + str(f))
+        ctx.log("  " + str(f))
     if len(files) > 200:
-        log("  ... %d more" % (len(files) - 200))
-    log("")
-    log("This violates the user's default 'no batch delete' rule, so it needs an explicit OK.")
+        ctx.log("  ... %d more" % (len(files) - 200))
+    ctx.log("")
+    ctx.log("This violates the user's default 'no batch delete' rule, so it needs an explicit OK.")
     if not args.confirm_delete:
-        log("Refusing: re-run with --confirm-delete after the user confirms.")
+        ctx.log("Refusing: re-run with --confirm-delete after the user confirms.")
+        if ctx.json:
+            ctx.emit({"deleted": 0, "refused": True, "files": [str(f) for f in files]})
         return
     if not ctx.yes:
         try:
@@ -1750,74 +2396,128 @@ def cmd_trash(ctx):
         except EOFError:
             answer = ""
         if answer != "DELETE":
-            log("aborted, nothing deleted")
+            ctx.log("aborted, nothing deleted")
+            if ctx.json:
+                ctx.emit({"deleted": 0, "aborted": True})
             return
     removed = 0
     for f in files:
         try:
-            os.unlink(str(f))
+            _unlink_file(f)
             removed += 1
         except OSError as exc:
-            log("  ! %s: %s" % (f, exc))
+            ctx.log("  ! %s: %s" % (f, exc))
     for v in sorted(victims, key=lambda x: len(str(x)), reverse=True):
-        for cur, dirs, _ in os.walk(v, topdown=False):
-            for d in dirs:
-                try:
-                    os.rmdir(os.path.join(cur, d))
-                except OSError:
-                    pass
-        try:
-            os.rmdir(str(v))
-        except OSError:
-            pass
-    log("deleted %d file(s); empty directories pruned." % removed)
+        if v.is_dir() and not is_skill_link(v):
+            for cur, dirs, _ in os.walk(str(v), topdown=False):
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(cur, d))
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(str(v))
+            except OSError:
+                pass
+    # Prune now-empty timestamp folders under trash root
+    for tsdir in sorted(root.iterdir()):
+        if tsdir.is_dir():
+            for cur, dirs, _ in os.walk(str(tsdir), topdown=False):
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(cur, d))
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(str(tsdir))
+            except OSError:
+                pass
+    ctx.log("deleted %d file(s); empty directories pruned." % removed)
+    if ctx.json:
+        ctx.emit({"deleted": removed, "victims": [str(v) for v in victims]})
 
 
 def cmd_restore(ctx):
     repo = ctx.require_repo()
     skills = repo_skills(repo)
-    targets = ctx.enabled_targets()
-    log("restore %d skill(s) into %d target dir(s) [%s]" % (len(skills), len(targets),
-                                                            "APPLY" if ctx.apply else "DRY-RUN"))
+    targets = ctx.enabled_targets(create=True)
+    ctx.log("restore %d skill(s) into %d target dir(s) [%s]" % (
+        len(skills), len(targets), "APPLY" if ctx.apply else "DRY-RUN"))
     for tr in targets:
-        log("  %-9s %-8s %s" % (tr["target"]["id"], tr["env"], tr["root"]))
+        ctx.log("  %-13s %-8s %s%s" % (
+            tr["target"]["id"], tr["env"], tr["root"], "" if tr["root"].is_dir() else " (will create)"))
     if not ctx.apply:
-        log("\nDry-run complete. Re-run with --apply.")
+        ctx.log("\nDry-run complete. Re-run with --apply.")
+        if ctx.json:
+            ctx.emit({"apply": False, "skills": len(skills),
+                      "targets": [{"id": tr["target"]["id"], "env": tr["env"], "path": str(tr["root"])} for tr in targets]})
         return
     created, errs = link_all(ctx, skills, targets)
-    log("linked %d, errors %d" % (created, errs))
+    ctx.record_location(repo)
+    ctx.log("linked %d, errors %d" % (created, errs))
+    if ctx.json:
+        ctx.emit({"apply": True, "skills": len(skills), "linked": created, "errors": errs})
 
 
 def cmd_push(ctx):
+    args = ctx.args
     repo = ctx.require_repo()
     if not git_is_repo(repo):
         die("%s is not a git repository" % repo)
     if not git_has_remote(repo):
-        die("no git remote. Add one: git -C %s remote add origin git@github.com:<you>/skills-repo.git" % repo)
-    msg = ctx.args.message or "sync: update skills"
-    if git_dirty(repo):
-        if not ctx.apply:
-            log("would: git add -A && git commit -m %r && git push" % msg)
-            log("dry-run complete. Re-run with --apply.")
-            return
-        git_commit(repo, msg)
+        die("no git remote. Add one: git -C %s remote add origin git@github.com:<you>/skills_repo.git" % repo)
+    msg = args.message or "sync: update skills"
+    dirty = git_dirty(repo)
+    findings = scan_secrets(repo)
+    if findings and not bool(getattr(args, "allow_secrets", False)):
+        ctx.log("BLOCKED: potential secrets detected in skills_repo:")
+        for f in findings[:10]:
+            ctx.log("  ! %s: %s" % (f["reason"], f["rel"]))
+        ctx.log("Remove the secrets before pushing (or pass --allow-secrets if these are false positives).")
+        if ctx.json:
+            ctx.emit({"apply": ctx.apply, "status": "blocked", "findings": findings})
+        sys.exit(2)
     if not ctx.apply:
-        log("would: git push")
+        if dirty:
+            ctx.log("would: git add -A && git commit -m %r && git push" % msg)
+        else:
+            ctx.log("would: git push")
+        ctx.log("dry-run complete. Re-run with --apply.")
+        if ctx.json:
+            ctx.emit({"apply": False, "dirty": dirty, "message": msg})
         return
-    rc, out, err = git(repo, "push")
-    log("push %s%s" % ("ok" if rc == 0 else "FAILED", "" if rc == 0 else ": " + (err or out)))
+    committed = False
+    if dirty:
+        committed = git_commit(repo, msg)
+    res = sync_push(ctx, repo, allow_secrets=bool(getattr(args, "allow_secrets", False)))
+    _log_sync_result(ctx, res)
+    if ctx.json:
+        ctx.emit({"apply": True, "committed": committed, "sync": res})
+    if res.get("status") not in ("ok",):
+        sys.exit(1)
 
 
 def cmd_pull(ctx):
     repo = ctx.require_repo()
     if not ctx.apply:
-        log("would: git pull --rebase && restore links")
+        ctx.log("would: git pull --rebase --autostash && prune dangling links && relink all targets")
+        ctx.log("dry-run complete. Re-run with --apply.")
+        if ctx.json:
+            ctx.emit({"apply": False})
         return
     rc, out, err = git(repo, "pull", "--rebase", "--autostash")
-    log("pull %s%s" % ("ok" if rc == 0 else "FAILED", "" if rc == 0 else ": " + (err or out)))
+    pull_ok = (rc == 0)
+    ctx.log("pull %s%s" % ("ok" if pull_ok else "FAILED", "" if pull_ok else ": " + (err or out)))
+    targets = ctx.enabled_targets(create=True)
+    pruned = prune_dangling_links(ctx, repo, targets=targets, apply=True)
     skills = repo_skills(repo)
-    created, errs = link_all(ctx, skills, ctx.enabled_targets())
-    log("relinked %d, errors %d" % (created, errs))
+    created, errs = link_all(ctx, skills, targets)
+    ctx.log("relinked %d, pruned %d dangling link(s), errors %d" % (created, len(pruned), errs))
+    if ctx.json:
+        ctx.emit({"apply": True, "pull_ok": pull_ok, "detail": out if pull_ok else (err or out),
+                  "relinked": created, "pruned": [p["path"] for p in pruned], "errors": errs})
+    if not pull_ok:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1830,37 +2530,39 @@ def build_parser():
     # defaults are SUPPRESS so a value given before the subcommand is not
     # overwritten by the subparser's default; main() fills the gaps.
     S = argparse.SUPPRESS
-    common.add_argument("--repo", default=S, help="path to the skills repo (default <home>/skills-repo)")
-    common.add_argument("--json", action="store_true", default=S, help="machine-readable output")
+    common.add_argument("--repo", default=S, help="path to skills_repo (default <home>/skills_repo)")
+    common.add_argument("--json", action="store_true", default=S, help="machine-readable JSON output")
     common.add_argument("--apply", action="store_true", default=S, help="execute instead of dry-run")
     common.add_argument("-y", "--yes", action="store_true", default=S, help="assume yes / non-interactive")
     common.add_argument("-v", "--verbose", action="store_true", default=S)
     common.add_argument("--include-windows", action="store_true", default=S,
                         help="also consider the CURRENT Windows user's dirs when running inside WSL")
     common.add_argument("--allow-cross-user", action="store_true", default=S,
-                        help="allow touching a Windows profile that is not the current user (refused by default)")
+                        help="allow touching Windows profile even when running as root")
 
     p = argparse.ArgumentParser(prog="skillkit", description="one-repo, symlink-first skill manager",
                                 parents=[common])
     p.add_argument("--version", action="version", version="skillkit " + VERSION)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("init", parents=[common], help="bootstrap repo + migrate existing skills + link")
+    sp = sub.add_parser("init", parents=[common], help="bootstrap skills_repo + migrate existing skills + link")
     sp.add_argument("--repo-url", help="git remote URL to attach (skips gh)")
-    sp.add_argument("--create-remote", action="store_true", help="create <you>/skills-repo via gh (private)")
+    sp.add_argument("--create-remote", action="store_true", help="create <you>/skills_repo via gh (private)")
     sp.add_argument("--copy", action="store_true",
-                    help="copy instead of move the originals (move is the default: they are backed up first)")
+                    help="copy instead of move the originals (leaves original dirs unlinked)")
     sp.add_argument("--no-dedupe", action="store_true", help="keep differing duplicate copies untouched")
     sp.add_argument("--prefer", choices=["newest", "majority"], default="newest",
                     help="conflict policy when the same skill differs between agents (default: newest)")
     sp.add_argument("--push", action="store_true", help="push after importing")
+    sp.add_argument("--no-push", action="store_true", help="skip automatic push to GitHub remote")
+    sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("scan", parents=[common], help="inventory skills across all agent dirs")
     sp.add_argument("--env", default="local", choices=["local", "windows", "all"])
     sp.set_defaults(func=cmd_scan)
 
-    sp = sub.add_parser("repo", parents=[common], help="show / set / forget which local repo this machine uses")
+    sp = sub.add_parser("repo", parents=[common], help="show / set / forget which local skills_repo this machine uses")
     sp.add_argument("--set", dest="set_path", help="record this path as the repo for this machine")
     sp.add_argument("--forget", action="store_true", help="drop the recorded location")
     sp.set_defaults(func=cmd_repo)
@@ -1871,23 +2573,29 @@ def build_parser():
     sp = sub.add_parser("list", parents=[common], help="list repo skills and their links")
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("status", parents=[common], help="repo + link status")
+    sp = sub.add_parser("status", parents=[common], help="repo + link + sync status")
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("doctor", parents=[common], help="validate skills, links, secrets, git")
-    sp.add_argument("--fix", action="store_true", help="repair missing/broken links")
+    sp.add_argument("--fix", action="store_true", help="repair missing/stale links and prune dangling links (use with --apply)")
     sp.set_defaults(func=cmd_doctor)
 
-    sp = sub.add_parser("add", parents=[common], help="install a skill (local dir or git URL) into the repo")
+    sp = sub.add_parser("add", parents=[common], help="install a skill (local dir or git URL) into skills_repo and sync")
     sp.add_argument("source")
-    sp.add_argument("--name")
-    sp.add_argument("--category")
-    sp.add_argument("--force", action="store_true")
-    sp.add_argument("--no-link", action="store_true")
+    sp.add_argument("--name", help="override skill directory name")
+    sp.add_argument("--skill", help="pick one skill by name when a git repo contains multiple skills")
+    sp.add_argument("--all", action="store_true", help="add all skills when a git repo contains multiple skills")
+    sp.add_argument("--category", help="optional subfolder under skills/")
+    sp.add_argument("--force", action="store_true", help="replace existing skill (old copy moves to trash)")
+    sp.add_argument("--no-link", action="store_true", help="do not create agent links")
+    sp.add_argument("--no-push", action="store_true", help="skip automatic push to GitHub remote")
+    sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")
     sp.set_defaults(func=cmd_add)
 
-    sp = sub.add_parser("update", parents=[common], help="re-fetch skills recorded with a git source")
+    sp = sub.add_parser("update", parents=[common], help="re-fetch skills recorded with a git source and sync")
     sp.add_argument("names", nargs="*")
+    sp.add_argument("--no-push", action="store_true", help="skip automatic push to GitHub remote")
+    sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")
     sp.set_defaults(func=cmd_update)
 
     sp = sub.add_parser("link", parents=[common], help="create links for repo skills")
@@ -1898,29 +2606,32 @@ def build_parser():
     sp.add_argument("--mode", choices=["auto", "symlink", "junction", "copy"])
     sp.set_defaults(func=cmd_link)
 
-    sp = sub.add_parser("unlink", parents=[common], help="remove links (payload stays in the repo)")
+    sp = sub.add_parser("unlink", parents=[common], help="remove links (payload stays in skills_repo)")
     sp.add_argument("names", nargs="*")
-    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--all", action="store_true", help="unlink every skill managed by this repo")
     sp.set_defaults(func=cmd_unlink)
 
-    sp = sub.add_parser("remove", parents=[common], help="unlink + move a skill to .trash (never deletes)")
+    sp = sub.add_parser("remove", parents=[common], help="unlink + move a skill to trash + sync (never deletes)")
     sp.add_argument("names", nargs="+")
+    sp.add_argument("--no-push", action="store_true", help="skip automatic push to GitHub remote")
+    sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")
     sp.set_defaults(func=cmd_remove)
 
     sp = sub.add_parser("trash", parents=[common],
                         help="list the trash; --purge deletes (needs --confirm-delete + typed confirmation)")
-    sp.add_argument("--purge", help="name, path fragment, or 'all' to purge")
+    sp.add_argument("--purge", help="exact entry name, timestamp, or 'all' to purge")
     sp.add_argument("--confirm-delete", action="store_true", help="required gate for any deletion")
     sp.set_defaults(func=cmd_trash)
 
-    sp = sub.add_parser("restore", parents=[common], help="rebuild every link from the repo (new machine)")
+    sp = sub.add_parser("restore", parents=[common], help="rebuild every link from skills_repo (new machine)")
     sp.set_defaults(func=cmd_restore)
 
-    sp = sub.add_parser("push", parents=[common], help="commit + push the repo")
+    sp = sub.add_parser("push", parents=[common], help="commit + push skills_repo (secret-checked)")
     sp.add_argument("-m", "--message")
+    sp.add_argument("--allow-secrets", action="store_true", help="allow push even if secret scanner warns")
     sp.set_defaults(func=cmd_push)
 
-    sp = sub.add_parser("pull", parents=[common], help="git pull --rebase + relink")
+    sp = sub.add_parser("pull", parents=[common], help="git pull --rebase + prune dangling links + relink")
     sp.set_defaults(func=cmd_pull)
 
     return p
@@ -1936,7 +2647,7 @@ def main(argv=None):
     ctx = Context(args)
     if args.cmd not in ("init", "targets", "scan", "repo"):
         if not ctx.repo:
-            die("no skills repo found. Pass --repo PATH, set SKILLKIT_REPO, or run 'skillkit init'.")
+            die("no skills_repo found. Pass --repo PATH, set SKILLKIT_REPO, or run 'skillkit init'.")
     try:
         args.func(ctx)
     except KeyboardInterrupt:

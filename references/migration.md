@@ -35,20 +35,20 @@ python3 scripts/skillkit.py scan --include-windows --json
 | 边界 | 规则 |
 |---|---|
 | 用户 | 只操作**当前用户**。目标目录必须在该环境 HOME 之下；超出即拒绝并报告 |
-| Windows 侧 | 仅当 profile 名 == 当前用户名时才处理；否则报告"cross-user refused"，不要擅自加 `--allow-cross-user` |
+| Windows 侧 | 只处理当前活跃 Windows 会话的 `%USERPROFILE%`（永不枚举 `C:\Users\*` 其他用户）；若 WSL 以 `root` 运行则直接拒绝 |
 | 项目级 | `<project>/.claude/skills`、`<project>/.agents/skills` 等**不动**，可以口头提醒 |
-| 第三方管理 | symlink/junction、`skills-lock.json`、`.skill-manager.json`、`install.json`、内含 `.git` → 跳过 |
+| 第三方管理 | 外部 symlink/junction、`skills-lock.json`、`.skill-manager.json`、`install.json`、内含 `.git` → 跳过（不参与冲突裁决） |
 | 删除 | 一律先报告 + 等用户确认；默认只做"移动到 trash" |
 
 ## 3. 决定仓库位置
 
 | 用户情况 | 仓库路径 |
 |---|---|
-| 只有 Linux / macOS | `~/skills-repo` |
-| Windows 单环境 | `%USERPROFILE%\skills-repo` |
-| WSL + Windows 双环境 | Windows 可见盘，如 `/mnt/d/skills-repo`（Windows 侧是 `D:\skills-repo`） |
+| 只有 Linux / macOS | `~/skills_repo` |
+| Windows 单环境 | `%USERPROFILE%\skills_repo` |
+| WSL + Windows 双环境 | Windows 可见盘，如 `/mnt/d/skills_repo`（Windows 侧是 `D:\skills_repo`） |
 
-WSL 下若用户坚持放 `~/skills-repo`（ext4），明确告知：Windows 侧 Agent 拿不到这批技能。
+WSL 下若用户坚持放 `~/skills_repo`（ext4），明确告知：Windows 侧 Agent 拿不到这批技能。
 
 ## 4. 远端仓库（私有）
 
@@ -64,11 +64,11 @@ git clone <url> <repo-path>        # 或 init 时带 --repo-url <url>
 # gh 已认证（gh = GitHub 官方 CLI）
 python3 scripts/skillkit.py init --repo <path> --create-remote --apply
 # 无 gh：由 init 打印两条命令，交给用户执行
-git -C <path> remote add origin git@github.com:<user>/skills-repo.git
+git -C <path> remote add origin git@github.com:<user>/skills_repo.git
 git -C <path> push -u origin HEAD
 ```
 
-`gh repo view <user>/skills-repo` 能查到就直接 clone，不要重复创建。
+`gh repo view <user>/skills_repo` 能查到就直接 clone，不要重复创建。
 
 ## 5. 迁移（唯一的破坏性步骤，且只是"移动"）
 
@@ -81,11 +81,11 @@ python3 scripts/skillkit.py init --repo <path> --include-windows --apply
 
 `--apply` 按顺序做：
 
-1. `git init` + `README.md` + `.gitignore` + `.gitattributes`（仓库为空时）。
+1. `git init` + `skill-manager.json` + `README.md` + `.gitignore` + `.gitattributes`（仓库为空时）。
 2. 每个 skill：先把原目录复制到 `.skill-manager/backup/<ts>/<env>/<name>/`，再**移动**到 `skills/<name>/`。
 3. 同名多副本：**保留最新版本**（默认 `--prefer newest`）；其余备份后移入 `.skill-manager/trash/<ts>/`。
-4. 在每个已存在的 Agent 目录建链（POSIX symlink，Windows junction）。
-5. `git commit`。
+4. 自动创建通用落点（`~/.agents/skills`、`~/.config/agents/skills`）并在每个已存在的 Agent 目录建链（POSIX symlink，Windows junction）。
+5. `git commit`；若已配置远端且通过密钥扫描，自动推送到 GitHub（加 `--no-push` 可跳过）。
 
 **不要**自己写 `mv` / `ln -s` 代替这一步：备份、冲突裁决、幂等、跨平台链接都在脚本里。
 

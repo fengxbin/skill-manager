@@ -65,11 +65,11 @@ _TARGET_SPEC = [
     ("codex", "OpenAI Codex CLI", [".codex/skills"], "auto", "海外", "doc"),
     ("gemini", "Google Gemini CLI", [".gemini/skills"], "auto", "海外", "doc"),
     ("antigravity", "Google Antigravity / Antigravity CLI",
-     [".gemini/antigravity/skills", ".gemini/config/skills", ".antigravity/skills"], "auto", "海外", "doc"),
+     [".gemini/config/skills", ".gemini/antigravity/skills", ".antigravity/skills"], "auto", "海外", "doc"),
     ("copilot", "GitHub Copilot CLI", [".copilot/skills"], "auto", "海外", "doc"),
     ("cursor", "Cursor", [".cursor/skills"], "auto", "海外", "doc"),
     ("windsurf", "Windsurf (Codeium)", [".codeium/windsurf/skills", ".windsurf/skills"], "auto", "海外", "doc"),
-    ("opencode", "opencode", [".config/opencode/skill", ".config/opencode/skills"], "auto", "海外", "doc"),
+    ("opencode", "opencode", [".config/opencode/skills", ".config/opencode/skill"], "auto", "海外", "doc"),
     ("amp", "Amp (Sourcegraph)", [".config/amp/skills"], "auto", "海外", "doc"),
     ("crush", "Crush (Charm)", [".config/crush/skills"], "auto", "海外", "doc"),
     ("goose", "Goose (Block)", [".config/goose/skills"], "auto", "海外", "doc"),
@@ -77,7 +77,7 @@ _TARGET_SPEC = [
     ("droid", "Factory Droid", [".factory/skills"], "auto", "海外", "doc"),
     ("augment", "Augment Code", [".augment/skills"], "auto", "海外", "doc"),
     ("continue", "Continue", [".continue/skills"], "auto", "海外", "doc"),
-    ("cline", "Cline", [".cline/skills"], "auto", "海外", "probable"),
+    ("cline", "Cline", [".cline/skills"], "auto", "海外", "doc"),
     ("roo", "Roo Code", [".roo/skills"], "auto", "海外", "doc"),
     ("kilo", "Kilo Code", [".kilo/skills"], "auto", "海外", "doc"),
     ("kiro", "Kiro CLI (AWS)", [".kiro/skills"], "auto", "海外", "doc"),
@@ -127,7 +127,7 @@ _TARGET_SPEC = [
     ("iflow", "iFlow CLI 心流（阿里/心流）", [".iflow/skills"], "auto", "国内", "doc"),
     ("qoder", "Qoder（阿里国际）", [".qoder/skills"], "auto", "国内", "doc"),
     ("qoder-cn", "Qoder CN（阿里）", [".qoder-cn/skills"], "auto", "国内", "doc"),
-    ("codebuddy", "CodeBuddy / WorkBuddy（腾讯）", [".codebuddy/skills"], "auto", "国内", "doc"),
+    ("codebuddy", "CodeBuddy / WorkBuddy（腾讯）", [".codebuddy/skills", ".workbuddy/skills"], "auto", "国内", "doc"),
     ("codearts", "CodeArts Agent（华为云）", [".codeartsdoer/skills"], "auto", "国内", "doc"),
     ("zcode", "ZCode / 智谱 GLM Coding", [".zcode/skills"], "auto", "国内", "doc"),
     ("minimax", "MiniMax Code", [".minimax/skills"], "auto", "国内", "doc"),
@@ -145,6 +145,30 @@ TARGET_BY_ID = {t["id"]: t for t in TARGETS}
 
 IGNORE_DIR_NAMES = {".git", ".skill-manager", "node_modules", ".venv", "__pycache__", ".ds_store", ".idea"}
 IGNORE_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+# Dynamic target discovery exclusions: never scan dev caches, IDE extensions,
+# or built-in/system read-only skill folders (e.g. .codex/skills/.system,
+# .cursor/skills-cursor, .gemini/antigravity/builtin/skills).
+DISCOVER_SKIP_TOP_DIRS = {
+    ".git", ".cache", ".npm", ".cargo", ".rustup", ".m2", ".gradle", ".nuget",
+    ".vscode", ".vscode-insiders", ".vscode-server", ".docker", ".ssh", ".gnupg",
+    ".local", ".venv", ".pyenv", ".nvm", ".rbenv", ".asdf", ".conda", ".ipython",
+    ".jupyter", ".trash", ".kube", ".aws", ".azure", ".gcloud", ".terraform.d",
+    ".mozilla", ".pki", ".dbus", ".cups", ".oh-my-zsh", ".zsh", ".bash", ".vim",
+    ".emacs.d", ".android", ".bun", ".deno", ".pnpm-store", ".yarn", ".pip",
+    ".skill-manager",
+}
+DISCOVER_SKIP_SUBDIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "cache", "caches",
+    "logs", "log", "tmp", "temp", "brain", "builtin", "builtins", ".system",
+    ".system_generated", "skills-cursor", "blobs", "extensions", "ext",
+    "plugins", "plugin", "marketplaces", "marketplace", "connectors",
+    "connectors-marketplace", "vendor", "vendor_imports", "security-resources",
+    "bin", "lib", "site-packages", "dist", "build", "target", "backups",
+    "backup", "trash", ".skill-manager", "sessions", "history", "telemetry",
+    "crashpad", "gpucache", "code cache", "cacheddata", "user data", "storage",
+    "checkpoints", "conversations", "projects", "worktrees", "npm", "packages",
+}
 
 SECRET_PATTERNS = [
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "GitHub PAT"),
@@ -404,7 +428,7 @@ def _safe_walk(root):
             else:
                 safe_dirs.append(d)
         dirs[:] = safe_dirs
-        yield cur, safe_dirs, files, link_dirs
+        yield cur, dirs, files, link_dirs
 
 
 def _cleanup_temp_dir(tmp):
@@ -533,8 +557,40 @@ def _unique_path(parent, label):
         i += 1
 
 
+def _safe_is_dir(p):
+    """Path.is_dir() that returns False instead of crashing on PermissionError."""
+    try:
+        return Path(p).is_dir()
+    except OSError:
+        return False
+
+
+def _slug_from_relpath(relpath, taken_ids):
+    """Derive a stable, readable target ID from a discovered relative path."""
+    parts = [p for p in Path(relpath).parts if p]
+    cleaned = []
+    for p in parts:
+        pl = p.lower()
+        if pl in (".config", "appdata", "roaming", "library", "application support", "skills", "skill"):
+            continue
+        s = re.sub(r"[^a-z0-9-]+", "-", pl.lstrip(".")).strip("-")
+        if s:
+            cleaned.append(s)
+    base = "-".join(cleaned) or "discovered"
+    cand = base
+    i = 2
+    while cand in taken_ids:
+        cand = "%s-%d" % (base, i)
+        i += 1
+    taken_ids.add(cand)
+    return cand
+
+
 def is_skill_dir(p):
-    return (Path(p) / SKILL_FILE).is_file()
+    try:
+        return (Path(p) / SKILL_FILE).is_file()
+    except OSError:
+        return False
 
 
 def _repo_name_from_url(url):
@@ -601,6 +657,7 @@ class Context(object):
         self.home = Path(os.environ.get("SKILLKIT_HOME") or Path.home())
         self.wsl = is_wsl()
         self.environment_notes = []
+        self._discovered_cache = {}
         self.repo_source = "none"
         self.repo = self._resolve_repo()
         self.config = self._load_config()
@@ -712,6 +769,8 @@ class Context(object):
             "category_layout": True,
             "conflict_policy": "newest",
             "auto_push": True,
+            "discover_targets": True,
+            "custom_targets": {},
             "sources": {},
         }
         if self.repo:
@@ -813,9 +872,192 @@ class Context(object):
                 self.environment_notes.append(reason)
         return homes
 
-    # -- target roots -----------------------------------------------------
+    # -- target roots & active dynamic discovery --------------------------
+    def custom_target_specs(self):
+        """User/Agent-registered custom targets stored in skill-manager.json."""
+        raw = self.config.get("custom_targets") or {}
+        specs = []
+        if not isinstance(raw, dict):
+            return specs
+        for tid, val in sorted(raw.items()):
+            rels = val if isinstance(val, list) else [val]
+            rels = [str(r).strip() for r in rels if str(r).strip()]
+            if not rels:
+                continue
+            specs.append({
+                "id": str(tid),
+                "label": "Custom target (%s)" % tid,
+                "relpaths": rels,
+                "relpath": rels[0],
+                "bind": "auto",
+                "family": "自定义",
+                "src": "custom",
+            })
+        return specs
+
     def candidate_roots(self, target, home):
-        return [Path(home) / rel for rel in target.get("relpaths") or [target["relpath"]]]
+        out = []
+        for rel in target.get("relpaths") or [target["relpath"]]:
+            p = Path(rel).expanduser()
+            out.append(p if p.is_absolute() else (Path(home) / p))
+        return out
+
+    def _is_excluded_discovery_path(self, cand, home, known_roots):
+        if not self._within(cand, home):
+            return True
+        if self.repo and path_within(cand, self.repo):
+            return True
+        if path_within(cand, SELF_SKILL_ROOT):
+            return True
+        if any(path_within(cand, kr) for kr in known_roots):
+            return True
+        return False
+
+    def discover_extra_targets(self, env, home):
+        """Actively discover skill directories not listed in the static table.
+
+        Scans bounded user-level config roots (~/.*, ~/.config/*, and direct
+        AppData/Roaming/<App>/skills or Library/Application Support/<App>/skills)
+        while skipping system/built-in read-only folders, caches, and already-known
+        targets. Results are cached per (env, home).
+        """
+        if bool(getattr(self.args, "no_discover", False)):
+            return []
+        if not self.config.get("discover_targets", True):
+            return []
+        home = Path(home)
+        cache_key = (env, _norm_path(home))
+        if cache_key in self._discovered_cache:
+            return self._discovered_cache[cache_key]
+
+        static_and_custom = TARGETS + self.custom_target_specs()
+        known_roots = []
+        taken_ids = {t["id"] for t in static_and_custom}
+        for t in static_and_custom:
+            for r in self.candidate_roots(t, home):
+                known_roots.append(r)
+
+        discovered_paths = {}  # norm_path -> Path
+
+        def _record(cand):
+            if self._is_excluded_discovery_path(cand, home, known_roots):
+                return
+            discovered_paths[_norm_path(cand)] = cand
+
+        # 1) Bounded shallow walk under hidden dot-directories in HOME (includes ~/.config)
+        try:
+            top_entries = sorted(home.iterdir())
+        except OSError:
+            top_entries = []
+        for top in top_entries:
+            if not top.name.startswith(".") or top.name.lower() in DISCOVER_SKIP_TOP_DIRS:
+                continue
+            if is_skill_link(top) or not _safe_is_dir(top):
+                continue
+            for cur, dirs, files, _ in _safe_walk(top):
+                curp = Path(cur)
+                try:
+                    rel_parts = curp.relative_to(home).parts
+                except ValueError:
+                    dirs[:] = []
+                    continue
+                if len(rel_parts) > 5 or self._is_excluded_discovery_path(curp, home, known_roots):
+                    dirs[:] = []
+                    continue
+                # Prune noise, hidden subdirs (.system/.git), built-in/vendor/marketplace folders
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and d.lower() not in DISCOVER_SKIP_SUBDIRS
+                    and "marketplace" not in d.lower()
+                    and "vendor" not in d.lower()
+                    and "builtin" not in d.lower()
+                ]
+                # Signal B: convention dir literally named `skills` under a dot/config root (depth 2..4)
+                if curp.name.lower() == "skills" and 2 <= len(rel_parts) <= 4:
+                    _record(curp)
+                    dirs[:] = []
+                    continue
+                # Signal A: <parent>/<skill>/SKILL.md where parent looks like a skills container
+                if SKILL_FILE in files and 3 <= len(rel_parts) <= 5:
+                    parent = curp.parent
+                    pl = parent.name.lower()
+                    if (
+                        parent != home
+                        and parent != (home / ".config")
+                        and not parent.name.startswith(".")
+                        and pl not in DISCOVER_SKIP_SUBDIRS
+                        and "skill" in pl
+                    ):
+                        _record(parent)
+                    dirs[:] = []  # never descend inside a skill
+
+        # 2) Fast O(N) depth-2 check for desktop agents in AppData/Roaming or Application Support
+        desktop_roots = []
+        if os.name == "nt" or env == "windows":
+            desktop_roots.append(home / "AppData" / "Roaming")
+        if sys.platform == "darwin" and env == "local":
+            desktop_roots.append(home / "Library" / "Application Support")
+        for droot in desktop_roots:
+            if not _safe_is_dir(droot) or is_skill_link(droot):
+                continue
+            try:
+                apps = sorted(droot.iterdir())
+            except OSError:
+                continue
+            for app in apps:
+                if app.name.startswith(".") or app.name.lower() in DISCOVER_SKIP_SUBDIRS:
+                    continue
+                if is_skill_link(app) or not _safe_is_dir(app):
+                    continue
+                for subname in ("skills", "skill"):
+                    cand = app / subname
+                    if is_skill_link(cand) or not _safe_is_dir(cand):
+                        continue
+                    if self._is_excluded_discovery_path(cand, home, known_roots):
+                        continue
+                    # Require at least one real <skill>/SKILL.md inside AppData/Application Support
+                    try:
+                        has_skill = any(
+                            _safe_is_dir(child) and is_skill_dir(child)
+                            for child in cand.iterdir()
+                            if not child.name.startswith(".")
+                        )
+                    except OSError:
+                        has_skill = False
+                    if has_skill:
+                        _record(cand)
+
+        # Deduplicate ancestor/descendant overlaps (keep the shallower skills root)
+        ordered = sorted(discovered_paths.values(), key=lambda p: len(p.parts))
+        kept = []
+        for p in ordered:
+            if any(path_within(p, anc) for anc in kept):
+                continue
+            kept.append(p)
+
+        specs = []
+        for p in kept:
+            try:
+                rel = str(p.relative_to(home)).replace(os.sep, "/")
+            except ValueError:
+                rel = str(p)
+            tid = _slug_from_relpath(rel, taken_ids)
+            specs.append({
+                "id": tid,
+                "label": "Auto-discovered (%s)" % rel,
+                "relpaths": [rel],
+                "relpath": rel,
+                "bind": "auto",
+                "family": "自动发现",
+                "src": "discovered",
+            })
+        self._discovered_cache[cache_key] = specs
+        return specs
+
+    def all_targets_for(self, env, home):
+        """Unified target list: static baseline + persisted custom + actively discovered."""
+        return TARGETS + self.custom_target_specs() + self.discover_extra_targets(env, home)
 
     def target_roots(self, target, env, home, create=False):
         """Existing candidate directories for a target (all of them).
@@ -823,7 +1065,7 @@ class Context(object):
         With create=True, an "always" bind target returns its primary directory
         so it can be created during --apply (dry-run never creates dirs).
         """
-        roots = [r for r in self.candidate_roots(target, home) if r.is_dir()]
+        roots = [r for r in self.candidate_roots(target, home) if _safe_is_dir(r)]
         if roots:
             return roots
         if create and target["bind"] == "always":
@@ -841,8 +1083,9 @@ class Context(object):
         explicit = self.config.get("targets")
         homes = self.env_homes(include_windows=bool(getattr(self.args, "include_windows", False)))
         resolved = []
+        seen_roots = set()
         for env, home in homes.items():
-            for t in TARGETS:
+            for t in self.all_targets_for(env, home):
                 if explicit and t["id"] not in explicit:
                     continue
                 for root in self.target_roots(t, env, home, create=create):
@@ -851,6 +1094,10 @@ class Context(object):
                         if note not in self.environment_notes:
                             self.environment_notes.append(note)
                         continue
+                    key = _norm_path(root)
+                    if key in seen_roots:
+                        continue
+                    seen_roots.add(key)
                     resolved.append({"target": t, "env": env, "root": root})
         return resolved
 
@@ -858,16 +1105,21 @@ class Context(object):
         homes = self.env_homes(include_windows=include_windows)
         out = []
         for tid in ids:
-            t = TARGET_BY_ID.get(tid)
-            if not t:
-                die("unknown target id: %s" % tid)
+            matched_any = False
             for env, home in homes.items():
-                roots = [r for r in self.candidate_roots(t, home) if r.is_dir()]
+                by_id = {t["id"]: t for t in self.all_targets_for(env, home)}
+                t = by_id.get(tid)
+                if not t:
+                    continue
+                matched_any = True
+                roots = [r for r in self.candidate_roots(t, home) if _safe_is_dir(r)]
                 if not roots:
                     roots = [self.candidate_roots(t, home)[0]]
                 for root in roots:
                     if self._within(root, home):
                         out.append({"target": t, "env": env, "root": root})
+            if not matched_any:
+                die("unknown target id: %s (run 'skillkit targets' or register with 'skillkit targets --add %s <path>')" % (tid, tid))
         return out
 
     # -- scaffolding ------------------------------------------------------
@@ -1052,10 +1304,15 @@ def prune_dangling_links(ctx, repo, targets=None, apply=False):
 def scan_env(ctx, env, home):
     """Find every skill living in a given environment's agent directories."""
     found = []
-    for t in TARGETS:
+    seen_roots = set()
+    for t in ctx.all_targets_for(env, home):
         for root in ctx.target_roots(t, env, home):
             if not ctx._within(root, home):
                 continue
+            rkey = _norm_path(root)
+            if rkey in seen_roots:
+                continue
+            seen_roots.add(rkey)
             try:
                 entries = sorted(root.iterdir())
             except OSError:
@@ -1238,17 +1495,63 @@ def _log_sync_result(ctx, res):
 
 
 def cmd_targets(ctx):
-    """Show the whole table: which agent dirs exist, and what is inside."""
+    """Show detected agent dirs (static + custom + auto-discovered), or add/remove custom targets."""
+    args = ctx.args
+    if getattr(args, "add_target", None):
+        repo = ctx.require_repo()
+        tid, raw_path = args.add_target
+        tid = re.sub(r"[^A-Za-z0-9._-]", "-", tid.strip()).strip("-")
+        if not tid:
+            die("invalid target id")
+        p = Path(raw_path).expanduser()
+        abs_p = p if p.is_absolute() else (ctx.home / p)
+        if not ctx._within(abs_p, ctx.home):
+            die("refusing custom target outside %s: %s" % (ctx.home, abs_p))
+        if path_within(abs_p, repo):
+            die("refusing custom target inside skills-repo: %s" % abs_p)
+        try:
+            rel = str(abs_p.resolve().relative_to(ctx.home.resolve())).replace(os.sep, "/")
+        except ValueError:
+            rel = str(p).replace("\\", "/")
+        custom = ctx.config.setdefault("custom_targets", {})
+        existing_list = custom.get(tid)
+        if isinstance(existing_list, list):
+            if rel not in existing_list:
+                existing_list.append(rel)
+        elif isinstance(existing_list, str) and existing_list != rel:
+            custom[tid] = [existing_list, rel]
+        else:
+            custom[tid] = [rel]
+        ctx.save_config()
+        git_commit(repo, "config: add custom target %s (%s)" % (tid, rel))
+        ctx.emit({"id": tid, "relpaths": custom[tid], "path": str(ctx.home / rel)},
+                 "registered custom target '%s' -> %s (saved in %s)" % (tid, rel, repo / CONFIG_NAME))
+        return
+
+    if getattr(args, "remove_target", None):
+        repo = ctx.require_repo()
+        tid = args.remove_target.strip()
+        custom = ctx.config.get("custom_targets") or {}
+        if tid not in custom:
+            die("no custom target named %r in %s" % (tid, repo / CONFIG_NAME))
+        removed_val = custom.pop(tid)
+        ctx.config["custom_targets"] = custom
+        ctx.save_config()
+        git_commit(repo, "config: remove custom target %s" % tid)
+        ctx.emit({"removed": tid, "relpaths": removed_val},
+                 "removed custom target '%s' from %s" % (tid, repo / CONFIG_NAME))
+        return
+
     rows = []
     homes = ctx.env_homes(include_windows=ctx.wsl or bool(ctx.args.include_windows))
     for env, home in homes.items():
-        for t in TARGETS:
+        for t in ctx.all_targets_for(env, home):
             candidates = ctx.candidate_roots(t, home)
-            existing = [r for r in candidates if r.is_dir()]
+            existing = [r for r in candidates if _safe_is_dir(r)]
             n = 0
             for root in existing:
                 try:
-                    n += sum(1 for e in root.iterdir() if e.is_dir() or is_skill_link(e))
+                    n += sum(1 for e in root.iterdir() if _safe_is_dir(e) or is_skill_link(e))
                 except OSError:
                     pass
             rows.append({
@@ -1259,22 +1562,26 @@ def cmd_targets(ctx):
                 "exists": bool(existing), "entries": n,
                 "bound": bool(existing) or t["bind"] == "always",
             })
+    src_badge = {"doc": "doc", "probable": "?", "custom": "cust", "discovered": "auto"}
     found = [r for r in rows if r["exists"]]
-    lines = ["%-8s %-13s %-5s %-4s %-5s %s" % ("ENV", "ID", "EXIST", "SRC", "SKILL", "PATH")]
+    discovered = [r for r in found if r["src"] == "discovered"]
+    custom_rows = [r for r in rows if r["src"] == "custom"]
+    lines = ["%-8s %-15s %-5s %-4s %-5s %s" % ("ENV", "ID", "EXIST", "SRC", "SKILL", "PATH")]
     for r in found:
-        lines.append("%-8s %-13s %-5s %-4s %-5d %s" % (
-            r["env"], r["id"], "yes", "doc" if r["src"] == "doc" else "?", r["entries"], r["path"]))
+        lines.append("%-8s %-15s %-5s %-4s %-5d %s" % (
+            r["env"], r["id"][:15], "yes", src_badge.get(r["src"], "?"), r["entries"], r["path"]))
     hub = [r for r in rows if not r["exists"] and r["bind"] == "always"]
     for r in hub:
-        lines.append("%-8s %-13s %-5s %-4s %-5d %s (created on apply)" % (
-            r["env"], r["id"], "no", "doc", 0, r["path"]))
+        lines.append("%-8s %-15s %-5s %-4s %-5d %s (created on apply)" % (
+            r["env"], r["id"][:15], "no", "doc", 0, r["path"]))
     lines.append("")
-    lines.append("%d detected dir(s) across %d environment(s); %d agent type(s) known." % (
-        len(found), len(homes), len(TARGETS)))
+    lines.append("%d detected dir(s) (%d auto-discovered, %d custom) across %d environment(s); %d built-in agent type(s)." % (
+        len(found), len(discovered), len(custom_rows), len(homes), len(TARGETS)))
     for note in ctx.environment_notes:
         lines.append("note: " + note)
     ctx.emit({"environments": {k: str(v) for k, v in homes.items()},
-              "detected": found, "hubs": hub, "known_targets": len(TARGETS),
+              "detected": found, "discovered": discovered, "custom": custom_rows,
+              "hubs": hub, "known_targets": len(TARGETS),
               "notes": ctx.environment_notes}, "\n".join(lines))
 
 
@@ -2624,14 +2931,14 @@ def cmd_install(ctx):
     for tr in targets:
         root = tr["root"]
         link = root / skill_name
-        if same_path(link, src):
-            ctx.log("  = %-13s %-8s %s (already here)" % (tr["target"]["id"], tr["env"], link))
-            actions.append({"target_id": tr["target"]["id"], "env": tr["env"], "path": str(link), "status": "already_here"})
+        if link_points_to(link, src):
+            ctx.log("  = %-15s %-8s %s (already linked)" % (tr["target"]["id"][:15], tr["env"], link))
+            actions.append({"target_id": tr["target"]["id"], "env": tr["env"], "path": str(link), "status": "already_linked"})
             skipped += 1
             continue
-        if link_points_to(link, src):
-            ctx.log("  = %-13s %-8s %s (already linked)" % (tr["target"]["id"], tr["env"], link))
-            actions.append({"target_id": tr["target"]["id"], "env": tr["env"], "path": str(link), "status": "already_linked"})
+        if not is_skill_link(link) and same_path(link, src):
+            ctx.log("  = %-15s %-8s %s (already here)" % (tr["target"]["id"][:15], tr["env"], link))
+            actions.append({"target_id": tr["target"]["id"], "env": tr["env"], "path": str(link), "status": "already_here"})
             skipped += 1
             continue
         if link.exists() or is_skill_link(link):
@@ -2759,6 +3066,8 @@ def build_parser():
                         help="also consider the CURRENT Windows user's dirs when running inside WSL")
     common.add_argument("--allow-cross-user", action="store_true", default=S,
                         help="allow touching Windows profile even when running as root")
+    common.add_argument("--no-discover", action="store_true", default=S,
+                        help="disable active dynamic discovery of unlisted agent skill directories")
 
     p = argparse.ArgumentParser(prog="skillkit", description="one-repo, symlink-first skill manager",
                                 parents=[common])
@@ -2795,7 +3104,12 @@ def build_parser():
     sp.add_argument("--forget", action="store_true", help="drop the recorded location")
     sp.set_defaults(func=cmd_repo)
 
-    sp = sub.add_parser("targets", parents=[common], help="show detected agent skill directories")
+    sp = sub.add_parser("targets", parents=[common],
+                        help="show detected agent skill directories (static + custom + auto-discovered)")
+    sp.add_argument("--add", dest="add_target", nargs=2, metavar=("ID", "PATH"),
+                    help="persist a custom agent skill dir in skill-manager.json (relative to HOME)")
+    sp.add_argument("--remove", dest="remove_target", metavar="ID",
+                    help="remove a custom agent skill dir from skill-manager.json")
     sp.set_defaults(func=cmd_targets)
 
     sp = sub.add_parser("list", parents=[common], help="list repo skills and their links")
@@ -2869,7 +3183,8 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     for key, default in (("repo", None), ("json", False), ("apply", False), ("yes", False),
-                         ("verbose", False), ("include_windows", False), ("allow_cross_user", False)):
+                         ("verbose", False), ("include_windows", False), ("allow_cross_user", False),
+                         ("no_discover", False)):
         if not hasattr(args, key):
             setattr(args, key, default)
     ctx = Context(args)

@@ -5,6 +5,8 @@
   "category_layout": true,
   "conflict_policy": "newest",
   "auto_push": true,
+  "discover_targets": true,
+  "custom_targets": {},
   "sources": {
     "example-skill": "https://github.com/owner/example-skill"
   }

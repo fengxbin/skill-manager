@@ -1,7 +1,12 @@
 # Agent 目标目录表（targets）
 
-`scripts/skillkit.py` 用一张表描述"哪个 Agent 从哪个目录读 skill"，目前收录 **73 种**。
-**新增一个 Agent = 在 `_TARGET_SPEC` 里加一行元组**，其余逻辑不用改。
+`scripts/skillkit.py` 采用**三层目录发现机制**，避免因 Agent 版本迭代换目录或出现新工具而漏检：
+
+1. **静态基线表（73 种已知 Agent）**：`_TARGET_SPEC` 提供规范 ID 与多候选路径。
+2. **主动浅层动态发现（默认开启，`--no-discover` 可关闭）**：自动扫描当前用户配置根（`~/.*`、`~/.config/*`，以及 Windows `%APPDATA%\<App>\skills`、macOS `~/Library/Application Support/<App>/skills`），通过 `SKILL.md` 内容特征或空 `skills/` 约定目录发现不在表里的新目录（`SRC = auto`），同时严格排除工具内置只读目录（`.system`、`skills-cursor`、`builtin`）、缓存和 `node_modules`。
+3. **自定义目录持久化**：`skillkit targets --add <id> <relpath>` 将新路径写入 `skill-manager.json` 的 `custom_targets`（`SRC = cust`），`--remove <id>` 移除。
+
+如需把某个新工具沉淀进静态基线表，只需在 `_TARGET_SPEC` 里加一行元组：
 
 ```python
 ("newtool", "New Tool", [".newtool/skills"], "auto", "海外", "doc"),
@@ -11,7 +16,7 @@
 - **候选目录**：列出该工具所有已知写法；**存在的每一个都会被链接**（有的工具改过目录名，
   有的机器上装了同一工具的两个版本）。建新目录时用第一个。
 - **绑定**：`always` = 不存在也创建（跨工具的中立落点）；`auto` = 只有已存在才链接。
-- **来源**：`doc` = 厂商文档明确；`probable` = 社区/间接证据，仅在目录真实存在时生效。
+- **来源**：`doc` = 厂商文档明确；`probable` = 社区/间接证据；`cust` = 用户自定义；`auto` = 主动动态发现。
 
 ## 全部目标
 
@@ -22,11 +27,11 @@
 | `claude` | Claude Code（含 GLM Coding Plan 走 Claude 的场景） | `.claude/skills` | 存在才绑定 | 官方文档 |
 | `codex` | OpenAI Codex CLI | `.codex/skills` | 存在才绑定 | 官方文档 |
 | `gemini` | Google Gemini CLI | `.gemini/skills` | 存在才绑定 | 官方文档 |
-| `antigravity` | Google Antigravity / Antigravity CLI | `.gemini/antigravity/skills`<br>`.gemini/config/skills`<br>`.antigravity/skills` | 存在才绑定 | 官方文档 |
+| `antigravity` | Google Antigravity / Antigravity CLI | `.gemini/config/skills`<br>`.gemini/antigravity/skills`<br>`.antigravity/skills` | 存在才绑定 | 官方文档 |
 | `copilot` | GitHub Copilot CLI | `.copilot/skills` | 存在才绑定 | 官方文档 |
 | `cursor` | Cursor | `.cursor/skills` | 存在才绑定 | 官方文档 |
 | `windsurf` | Windsurf (Codeium) | `.codeium/windsurf/skills`<br>`.windsurf/skills` | 存在才绑定 | 官方文档 |
-| `opencode` | opencode | `.config/opencode/skill`<br>`.config/opencode/skills` | 存在才绑定 | 官方文档 |
+| `opencode` | opencode | `.config/opencode/skills`<br>`.config/opencode/skill` | 存在才绑定 | 官方文档 |
 | `amp` | Amp (Sourcegraph) | `.config/amp/skills` | 存在才绑定 | 官方文档 |
 | `crush` | Crush (Charm) | `.config/crush/skills` | 存在才绑定 | 官方文档 |
 | `goose` | Goose (Block) | `.config/goose/skills` | 存在才绑定 | 官方文档 |
@@ -34,7 +39,7 @@
 | `droid` | Factory Droid | `.factory/skills` | 存在才绑定 | 官方文档 |
 | `augment` | Augment Code | `.augment/skills` | 存在才绑定 | 官方文档 |
 | `continue` | Continue | `.continue/skills` | 存在才绑定 | 官方文档 |
-| `cline` | Cline | `.cline/skills` | 存在才绑定 | 社区推断 |
+| `cline` | Cline | `.cline/skills` | 存在才绑定 | 官方文档 |
 | `roo` | Roo Code | `.roo/skills` | 存在才绑定 | 官方文档 |
 | `kilo` | Kilo Code | `.kilo/skills` | 存在才绑定 | 官方文档 |
 | `kiro` | Kiro CLI (AWS) | `.kiro/skills` | 存在才绑定 | 官方文档 |
@@ -83,7 +88,7 @@
 | `iflow` | iFlow CLI 心流（阿里/心流） | `.iflow/skills` | 存在才绑定 | 官方文档 |
 | `qoder` | Qoder（阿里国际） | `.qoder/skills` | 存在才绑定 | 官方文档 |
 | `qoder-cn` | Qoder CN（阿里） | `.qoder-cn/skills` | 存在才绑定 | 官方文档 |
-| `codebuddy` | CodeBuddy / WorkBuddy（腾讯） | `.codebuddy/skills` | 存在才绑定 | 官方文档 |
+| `codebuddy` | CodeBuddy / WorkBuddy（腾讯） | `.codebuddy/skills`<br>`.workbuddy/skills` | 存在才绑定 | 官方文档 |
 | `codearts` | CodeArts Agent（华为云） | `.codeartsdoer/skills` | 存在才绑定 | 官方文档 |
 | `zcode` | ZCode / 智谱 GLM Coding | `.zcode/skills` | 存在才绑定 | 官方文档 |
 | `minimax` | MiniMax Code | `.minimax/skills` | 存在才绑定 | 官方文档 |

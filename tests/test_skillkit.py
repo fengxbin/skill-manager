@@ -404,11 +404,12 @@ class SkillkitTest(unittest.TestCase):
         self.assertTrue((self.home / ".codex" / "skills" / "skill-manager" / "SKILL.md").is_file())
         self.assertTrue((self.home / ".agents" / "skills" / "skill-manager" / "SKILL.md").is_file())
 
-        # Idempotent re-run
+        # Idempotent re-run must report already_linked (not already_here) for junctions/symlinks
         r2 = self.run_cli("install", "--apply", "--json")
         res2 = json.loads(r2.stdout)
         self.assertEqual(res2["linked"], 0)
         self.assertGreaterEqual(res2["skipped"], 4)
+        self.assertTrue(all(a["status"] == "already_linked" for a in res2["actions"]), res2["actions"])
 
         # After init, skill-manager is adopted into skills-repo and links are upgraded;
         # doctor must report 0 problems and no false warning for skill-manager
@@ -481,6 +482,61 @@ class SkillkitTest(unittest.TestCase):
         self.assertFalse((self.home / "skills-repo" / "skills" / "skill-manager").exists())
         doc = json.loads(self.run_cli("doctor", "--json").stdout)
         self.assertTrue(doc["ok"], doc)
+
+    def test_dynamic_target_discovery_exclusions_and_custom_targets(self):
+        # 1. Unlisted agent dirs that SHOULD be actively discovered:
+        #    (a) non-standard folder name containing a real SKILL.md (Signal A)
+        make_skill(self.home / ".future-agent" / "v2" / "my-skills" / "future-sk", "future-sk", body="v2")
+        #    (b) empty convention `skills/` folder under ~/.config (Signal B)
+        (self.home / ".config" / "brand-new-cli" / "skills").mkdir(parents=True)
+        #    (c) Windows AppData/Roaming/<App>/skills with a real SKILL.md
+        if os.name == "nt":
+            make_skill(self.home / "AppData" / "Roaming" / "DesktopCoder" / "skills" / "desk-sk", "desk-sk", body="desk")
+
+        # 2. System/built-in/noise dirs that MUST be excluded from dynamic discovery:
+        make_skill(self.home / ".codex" / "skills" / ".system" / "codex-sys", "codex-sys", body="sys")
+        make_skill(self.home / ".cursor" / "skills-cursor" / "cur-sys", "cur-sys", body="sys")
+        make_skill(self.home / ".gemini" / "antigravity" / "builtin" / "skills" / "agy-sys", "agy-sys", body="sys")
+        make_skill(self.home / ".cache" / "noisy" / "skills" / "cached-sk", "cached-sk", body="cache")
+        make_skill(self.home / ".future-agent" / "node_modules" / "pkg" / "skills" / "dep-sk", "dep-sk", body="dep")
+
+        # Check `targets --json`
+        t_data = json.loads(self.run_cli("targets", "--json").stdout)
+        disc_paths = [os.path.normcase(d["path"]) for d in t_data["discovered"]]
+        self.assertIn(os.path.normcase(str(self.home / ".future-agent" / "v2" / "my-skills")), disc_paths)
+        self.assertIn(os.path.normcase(str(self.home / ".config" / "brand-new-cli" / "skills")), disc_paths)
+        if os.name == "nt":
+            self.assertIn(os.path.normcase(str(self.home / "AppData" / "Roaming" / "DesktopCoder" / "skills")), disc_paths)
+        # None of the excluded system/cache/node_modules paths may appear
+        for bad in (".system", "skills-cursor", "builtin", ".cache", "node_modules"):
+            self.assertFalse(any(bad in p for p in disc_paths), "should have excluded %s: %s" % (bad, disc_paths))
+
+        # `--no-discover` turns off dynamic discovery cleanly
+        t_nodisc = json.loads(self.run_cli("targets", "--no-discover", "--json").stdout)
+        self.assertEqual(t_nodisc["discovered"], [])
+
+        # `init --apply` adopts skills from discovered dirs and links back into all of them
+        self.run_cli("init", "--apply")
+        repo = self.home / "skills-repo"
+        self.assertTrue((repo / "skills" / "future-sk" / "SKILL.md").is_file())
+        self.assertTrue((self.home / ".config" / "brand-new-cli" / "skills" / "future-sk" / "SKILL.md").is_file())
+        self.assertTrue((self.home / ".future-agent" / "v2" / "my-skills" / "future-sk" / "SKILL.md").is_file())
+        # Built-in skills were NOT adopted into skills-repo
+        for sys_sk in ("codex-sys", "cur-sys", "agy-sys", "cached-sk", "dep-sk"):
+            self.assertFalse((repo / "skills" / sys_sk).exists(), "must not adopt %s" % sys_sk)
+
+        # Doctor passes with 0 problems
+        doc = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertTrue(doc["ok"], doc)
+
+        # Persist a custom target via `targets --add`, link into it even with `--no-discover`, then remove
+        add_res = json.loads(self.run_cli("targets", "--add", "my-custom", ".my-custom/v3/prompt-skills", "--json").stdout)
+        self.assertEqual(add_res["id"], "my-custom")
+        self.run_cli("link", "future-sk", "--to", "my-custom", "--no-discover", "--apply")
+        self.assertTrue((self.home / ".my-custom" / "v3" / "prompt-skills" / "future-sk" / "SKILL.md").is_file())
+
+        rm_res = json.loads(self.run_cli("targets", "--remove", "my-custom", "--json").stdout)
+        self.assertEqual(rm_res["removed"], "my-custom")
 
 
 if __name__ == "__main__":

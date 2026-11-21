@@ -97,7 +97,8 @@ skillkit.py init      [--apply] [--repo-url URL | --create-remote] [--include-wi
                       [--push | --no-push]
 skillkit.py scan      [--env local|windows|all] [--include-windows] [--json]
 skillkit.py repo      [--set PATH | --forget]  # which local skills-repo this machine uses
-skillkit.py targets   [--json]                 # which agent dirs exist on this machine
+skillkit.py targets   [--add ID PATH | --remove ID] [--json]
+                                               # detected agent dirs (static + custom + auto-discovered)
 skillkit.py list      [--json]                 # repo skills + live links across targets
 skillkit.py status    [--json]                 # git state, auto_push, link counts
 skillkit.py doctor    [--fix] [--apply] [--json]  # frontmatter, links, secrets, unmanaged dirs
@@ -114,7 +115,7 @@ skillkit.py pull      [--apply]                # git pull --rebase + prune dangl
 ```
 
 Global flags: `--repo PATH` (default `~/skills-repo`, fallback `~/skills_repo`, override with `SKILLKIT_REPO`),
-`--json`, `--apply`, `-y`, `-v`, `--include-windows`, `--allow-cross-user`.
+`--json`, `--apply`, `-y`, `-v`, `--include-windows`, `--allow-cross-user`, `--no-discover`.
 Testing hook: `SKILLKIT_HOME` overrides `$HOME` for target discovery.
 
 ## Procedures
@@ -194,6 +195,7 @@ Do not purge it as part of the task; purging is the user's decision (`trash --pu
 | Symlink/junction creation fails | report error clearly; only use `--mode copy` if user explicitly accepts losing zero-drift |
 | Secret scanner blocks push | report exact file & secret type; ask user to clean it; never pass `--allow-secrets` silently |
 | User asks to delete something | print exact paths, wait for confirmation, then `trash --purge <entry> --confirm-delete`; no recursive delete ever |
+| Agent changed its skill dir or is unlisted | `skillkit` auto-discovers unlisted user skill dirs (`SRC=auto`); if still missed, inspect that tool's config/docs/`--help` and register with `targets --add <id> <relpath>` |
 | Repo location unclear | `repo` shows path + source (flag / env / recorded / default); ask only at `init` |
 
 ## Files

@@ -53,7 +53,7 @@ skillkit push -m "update <name>" --apply
 | Pi agent | `~/.pi/agent/skills/<name>` |
 | DeepSeek Harness | `~/.dsh/skills/<name>` |
 | Google Gemini CLI | `~/.gemini/skills/<name>` |
-| Google Antigravity | `~/.gemini/antigravity/skills/<name>`（或 `~/.gemini/config/skills/<name>`） |
+| Google Antigravity | `~/.gemini/config/skills/<name>`（兼容 `~/.gemini/antigravity/skills/<name>`） |
 | GitHub Copilot CLI | `~/.copilot/skills/<name>` |
 | Cursor | `~/.cursor/skills/<name>` |
 | Windsurf | `~/.codeium/windsurf/skills/<name>` |

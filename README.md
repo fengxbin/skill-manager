@@ -128,9 +128,10 @@ python3 ~/skill-manager/scripts/skillkit.py init --create-remote --apply
 假设已将 `skillkit.py` 链接为 `skillkit`（未链接则替换为 `python3 <路径>/scripts/skillkit.py`）：
 
 ```bash
-# 查看状态
-skillkit targets                  # 本机识别到的 Agent 默认技能目录
-skillkit scan                     # 只读盘点本机已有技能与冲突
+# 查看状态与管理目标目录
+skillkit targets                            # 本机识别到的 Agent 目录（内置 73 种 + 自动发现 + 自定义）
+skillkit targets --add <id> <相对HOME路径>   # 手动登记新版/小众 Agent 的技能目录
+skillkit scan                               # 只读盘点本机已有技能与冲突
 skillkit list                     # 列出 skills-repo 中的技能及链接状态
 skillkit status                   # 仓库、Git、auto_push 与链接概览
 skillkit doctor                   # 全面体检（frontmatter、断链、未纳管目录、密钥风险）

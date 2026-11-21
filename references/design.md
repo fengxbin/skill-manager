@@ -118,6 +118,8 @@
   "category_layout": true,
   "conflict_policy": "newest",
   "auto_push": true,
+  "discover_targets": true,
+  "custom_targets": {},
   "sources": { "some-skill": "https://github.com/owner/repo" }
 }
 ```
